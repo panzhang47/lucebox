@@ -79,7 +79,12 @@ int HttpServer::run() {
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)config_.port);
-    inet_pton(AF_INET, config_.host.c_str(), &sa.sin_addr);
+    if (inet_pton(AF_INET, config_.host.c_str(), &sa.sin_addr) != 1) {
+        std::fprintf(stderr, "[server] invalid host address: %s\n", config_.host.c_str());
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+        return 1;
+    }
 
     if (bind(listen_fd_, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         std::fprintf(stderr, "[server] bind(%s:%d) failed: %s\n",
@@ -389,13 +394,18 @@ void HttpServer::worker_loop() {
 
         // Emit initial SSE events.
         if (req.stream) {
+            bool start_ok = true;
             for (const auto & chunk : emitter.emit_start()) {
                 if (!send_all(fd, chunk.data(), chunk.size())) {
-                    std::lock_guard<std::mutex> lk(job->mu);
-                    job->done = true;
-                    job->cv.notify_one();
-                    continue;
+                    start_ok = false;
+                    break;
                 }
+            }
+            if (!start_ok) {
+                std::lock_guard<std::mutex> lk(job->mu);
+                job->done = true;
+                job->cv.notify_one();
+                continue;
             }
         }
 
@@ -817,7 +827,18 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
 
 bool HttpServer::send_response(int fd, int status, const std::string & content_type,
                                const std::string & body) {
-    std::string header = "HTTP/1.1 " + std::to_string(status) + " OK\r\n";
+    const char * reason = "OK";
+    switch (status) {
+        case 200: reason = "OK"; break;
+        case 204: reason = "No Content"; break;
+        case 400: reason = "Bad Request"; break;
+        case 404: reason = "Not Found"; break;
+        case 405: reason = "Method Not Allowed"; break;
+        case 413: reason = "Payload Too Large"; break;
+        case 500: reason = "Internal Server Error"; break;
+        case 503: reason = "Service Unavailable"; break;
+    }
+    std::string header = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
     if (config_.enable_cors) {
         header += "Access-Control-Allow-Origin: *\r\n"
                   "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
@@ -846,15 +867,6 @@ bool HttpServer::send_sse_headers(int fd) {
               "Cache-Control: no-cache\r\n"
               "Connection: keep-alive\r\n\r\n";
     return send_all(fd, header.data(), header.size());
-}
-
-bool HttpServer::send_sse_chunk(int fd, const std::string & data) {
-    std::string chunk = "data: " + data + "\n\n";
-    return send_all(fd, chunk.data(), chunk.size());
-}
-
-bool HttpServer::send_sse_done(int fd) {
-    return send_sse_chunk(fd, "[DONE]");
 }
 
 }  // namespace dflash27b

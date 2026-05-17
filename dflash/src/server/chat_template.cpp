@@ -46,10 +46,6 @@ std::string render_chat_template(
         // Laguna/DeepSeek format:
         //   <｜begin▁of▁sentence｜>system content
         //   <｜User｜>user content<｜Assistant｜>
-        result += "\xe2\xef\xbd\x9c"  // <｜begin▁of▁sentence｜> — we'll use text form
-                  ;
-        // Actually, Laguna uses special tokens that are tokenized directly.
-        // For text rendering before tokenization, use the token text forms.
         result = "<｜begin▁of▁sentence｜>";
         for (const auto & msg : messages) {
             if (msg.role == "system") {

@@ -9,6 +9,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -27,21 +28,22 @@ static int utf8_len(uint8_t c) {
     return 1;  // invalid — advance one byte
 }
 
-static uint32_t utf8_decode(const char * s, int * len) {
+static uint32_t utf8_decode(const char * s, size_t remaining, int * len) {
+    if (remaining == 0) { *len = 0; return 0xFFFD; }
     uint8_t c = (uint8_t)s[0];
     if (c < 0x80) { *len = 1; return c; }
-    if ((c & 0xE0) == 0xC0) {
+    if ((c & 0xE0) == 0xC0 && remaining >= 2) {
         *len = 2;
         return ((uint32_t)(c & 0x1F) << 6) |
                ((uint32_t)((uint8_t)s[1]) & 0x3F);
     }
-    if ((c & 0xF0) == 0xE0) {
+    if ((c & 0xF0) == 0xE0 && remaining >= 3) {
         *len = 3;
         return ((uint32_t)(c & 0x0F) << 12) |
                (((uint32_t)((uint8_t)s[1]) & 0x3F) << 6) |
                ((uint32_t)((uint8_t)s[2]) & 0x3F);
     }
-    if ((c & 0xF8) == 0xF0) {
+    if ((c & 0xF8) == 0xF0 && remaining >= 4) {
         *len = 4;
         return ((uint32_t)(c & 0x07) << 18) |
                (((uint32_t)((uint8_t)s[1]) & 0x3F) << 12) |
@@ -109,7 +111,7 @@ static bool is_mark(uint32_t cp) {
     if (cp >= 0x064B && cp <= 0x065F) return true;   // Arabic
     if (cp >= 0x0900 && cp <= 0x0903) return true;   // Devanagari
     if (cp >= 0x093A && cp <= 0x094F) return true;   // Devanagari
-    if (cp >= 0x0E31 && cp == 0x0E31) return true;   // Thai
+    if (cp == 0x0E31) return true;   // Thai
     if (cp >= 0x0E34 && cp <= 0x0E3A) return true;   // Thai
     if (cp >= 0xFE20 && cp <= 0xFE2F) return true;   // Combining Half Marks
     if (cp >= 0x20D0 && cp <= 0x20FF) return true;   // Combining for Symbols
@@ -147,7 +149,7 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
 
     auto peek_cp = [&](size_t p, int * cplen) -> uint32_t {
         if (p >= len) { *cplen = 0; return 0; }
-        return utf8_decode(s + p, cplen);
+        return utf8_decode(s + p, len - p, cplen);
     };
 
     while (pos < len) {
@@ -307,23 +309,22 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
 // Bytes in {33-126, 161-172, 174-255} map to themselves as a codepoint;
 // all others (0-32, 127-160, 173) map to U+0100..U+0143.
 static std::string byte_to_gpt2_unicode(uint8_t b) {
-    // Build forward table once: byte → codepoint.
-    static uint32_t fwd[256] = {0};
-    static bool built = false;
-    if (!built) {
+    // Build forward table once (thread-safe via C++11 static init).
+    static const auto fwd = []() {
+        std::array<uint32_t, 256> t{};
         int n = 0;
         for (int i = 0; i < 256; i++) {
             if ((i >= 33  && i <= 126) ||
                 (i >= 161 && i <= 172) ||
                 (i >= 174 && i <= 255)) {
-                fwd[i] = (uint32_t)i;
+                t[i] = (uint32_t)i;
             } else {
-                fwd[i] = 256 + n;
+                t[i] = 256 + n;
                 n++;
             }
         }
-        built = true;
-    }
+        return t;
+    }();
     uint32_t cp = fwd[b];
     // Encode codepoint as UTF-8.
     char buf[4];
@@ -605,21 +606,19 @@ static uint8_t gpt2_unicode_to_byte(uint32_t cp) {
         return (uint8_t)cp;
     }
     // Offset-mapped range: U+0100..U+0143 → non-printable bytes.
-    // Build the reverse table on first call.
-    static uint8_t table[68] = {0};
-    static bool built = false;
-    if (!built) {
+    // Build the reverse table once (thread-safe via C++11 static init).
+    static const auto table = []() {
+        std::array<uint8_t, 68> t{};
         int n = 0;
         for (int b = 0; b < 256; b++) {
             if ((b >= 33  && b <= 126) ||
                 (b >= 161 && b <= 172) ||
                 (b >= 174 && b <= 255)) continue;
-            // byte b maps to codepoint 256+n
-            table[n] = (uint8_t)b;
+            t[n] = (uint8_t)b;
             n++;
         }
-        built = true;
-    }
+        return t;
+    }();
     if (cp >= 256 && cp < 256 + 68) {
         return table[cp - 256];
     }
@@ -634,7 +633,7 @@ static std::string decode_gpt2_bpe(const std::string & tok) {
     const char * end = p + tok.size();
     while (p < end) {
         int cplen;
-        uint32_t cp = utf8_decode(p, &cplen);
+        uint32_t cp = utf8_decode(p, (size_t)(end - p), &cplen);
         out.push_back((char)gpt2_unicode_to_byte(cp));
         p += cplen;
     }

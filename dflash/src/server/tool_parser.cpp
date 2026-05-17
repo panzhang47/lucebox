@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -20,9 +21,11 @@ namespace dflash27b {
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 static std::string generate_call_id() {
+    static std::mutex rng_mu;
     static std::mt19937_64 rng(std::random_device{}());
     static const char hex[] = "0123456789abcdef";
     std::string id = "call_";
+    std::lock_guard<std::mutex> lk(rng_mu);
     for (int i = 0; i < 24; i++) {
         id += hex[rng() % 16];
     }
@@ -362,6 +365,8 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         auto begin = std::sregex_iterator(text.begin(), text.end(), re_tool_code());
         auto end = std::sregex_iterator();
         for (auto it = begin; it != end; ++it) {
+            size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
             std::string inner = (*it)[1].str();
             // trim
             size_t s = inner.find_first_not_of(" \t\n\r");

@@ -2737,8 +2737,6 @@ unsigned long raxTouch(raxNode *n) {
         } else {
             raxNode *child;
             memcpy(&child,cp,sizeof(child));
-            if (child == (void*)0x65d1760) count++;
-            if (count > 1) exit(1);
             sum += raxTouch(child);
         }
         cp++;

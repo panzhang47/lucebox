@@ -2,9 +2,6 @@
 
 #include "reasoning.h"
 
-#include <algorithm>
-#include <cstring>
-
 namespace dflash27b {
 
 static const char THINK_OPEN[]  = "<think>";

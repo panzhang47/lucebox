@@ -118,8 +118,6 @@ private:
                        const std::string & body);
     bool send_error(int fd, int status, const std::string & message);
     bool send_sse_headers(int fd);
-    bool send_sse_chunk(int fd, const std::string & data);
-    bool send_sse_done(int fd);
 
     // Send raw bytes with stall detection.
     bool send_all(int fd, const void * data, size_t len);

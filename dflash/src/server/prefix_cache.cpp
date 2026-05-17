@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
-#include <openssl/sha.h>
 
 namespace dflash27b {
 

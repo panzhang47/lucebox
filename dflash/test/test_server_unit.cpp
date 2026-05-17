@@ -14,7 +14,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
-#include "server/third_party/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <cstdio>
 #include <cstdlib>

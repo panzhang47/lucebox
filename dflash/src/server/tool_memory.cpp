@@ -98,9 +98,10 @@ void ToolMemory::drop_entry(const std::string & call_id) {
             block_it->second.refs--;
         }
         if (block_it->second.refs == 0) {
-            total_bytes_ -= block_it->second.size_bytes;
-            if (total_bytes_ > total_bytes_ + block_it->second.size_bytes) {
-                total_bytes_ = 0;  // underflow guard
+            if (block_it->second.size_bytes > total_bytes_) {
+                total_bytes_ = 0;
+            } else {
+                total_bytes_ -= block_it->second.size_bytes;
             }
             blocks_.erase(block_it);
         }
