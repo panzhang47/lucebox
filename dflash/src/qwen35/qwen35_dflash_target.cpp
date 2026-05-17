@@ -84,29 +84,14 @@ bool Qwen35DFlashTarget::verify_batch(
         return false;
     }
 
-    // ggml_argmax may return garbage on some CUDA architectures (e.g. Turing).
-    // Compute argmax from raw logits on CPU as a robust fallback.
-    const int vocab = w_.n_vocab;
-    auto cpu_argmax_from_logits = [&](int pos) -> int32_t {
-        std::vector<float> logits_row(vocab);
-        ggml_backend_tensor_get(sg_.logits, logits_row.data(),
-                                (size_t)pos * vocab * sizeof(float),
-                                sizeof(float) * vocab);
-        int32_t best_id = 0;
-        float best_val = logits_row[0];
-        for (int j = 1; j < vocab; j++) {
-            if (logits_row[j] > best_val) { best_val = logits_row[j]; best_id = j; }
-        }
-        return best_id;
-    };
-
-    last_tok = cpu_argmax_from_logits(n_tokens - 1);
+    // Read argmax results from GPU.
+    std::vector<int32_t> argmax_buf(n_tokens);
+    ggml_backend_tensor_get(sg_.argmax_tokens, argmax_buf.data(), 0,
+                            sizeof(int32_t) * n_tokens);
+    last_tok = argmax_buf[n_tokens - 1];
 
     if (all_argmax) {
-        all_argmax->resize(n_tokens);
-        for (int i = 0; i < n_tokens; i++) {
-            (*all_argmax)[i] = cpu_argmax_from_logits(i);
-        }
+        *all_argmax = std::move(argmax_buf);
     }
 
     cache_.cur_pos = base_pos + n_tokens;
@@ -148,22 +133,10 @@ bool Qwen35DFlashTarget::project_hidden_to_tokens(
     auto st = ggml_backend_graph_compute(backend_, proj_sg_.gf);
     if (st != GGML_STATUS_SUCCESS) return false;
 
-    // ggml_argmax may return garbage on some CUDA architectures.
-    // Compute argmax from raw logits on CPU.
-    const int vocab = w_.n_vocab;
+    // Read argmax results from GPU.
     tokens_out.resize(n_tokens);
-    for (int i = 0; i < n_tokens; i++) {
-        std::vector<float> logits_row(vocab);
-        ggml_backend_tensor_get(proj_sg_.logits, logits_row.data(),
-                                (size_t)i * vocab * sizeof(float),
-                                sizeof(float) * vocab);
-        int32_t best_id = 0;
-        float best_val = logits_row[0];
-        for (int j = 1; j < vocab; j++) {
-            if (logits_row[j] > best_val) { best_val = logits_row[j]; best_id = j; }
-        }
-        tokens_out[i] = best_id;
-    }
+    ggml_backend_tensor_get(proj_sg_.argmax_tokens, tokens_out.data(), 0,
+                            sizeof(int32_t) * n_tokens);
     return true;
 }
 
