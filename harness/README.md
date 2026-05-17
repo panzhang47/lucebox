@@ -1,7 +1,7 @@
 # Lucebox Harness
 
 <p align="center">
-  <img src="assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="100%">
+  <img src="assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="600">
 </p>
 
 Use this folder for two things:
