@@ -1357,6 +1357,452 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0 if payload["ok"] else 1
 
 
+# ── Math scoring helpers (ported from bench_llm.py) ─────────────────────────
+
+import re as _re
+
+
+def _extract_boxed(text: str) -> str | None:
+    """Extract the last \\boxed{...} from a string, handling nested braces."""
+    results = []
+    i = 0
+    while i < len(text):
+        idx = text.find("\\boxed{", i)
+        if idx == -1:
+            break
+        start = idx + len("\\boxed{")
+        depth = 1
+        j = start
+        while j < len(text) and depth > 0:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+            j += 1
+        if depth == 0:
+            results.append(text[start:j-1].strip())
+        i = j
+    return results[-1] if results else None
+
+
+def _normalize_math(s: str | None) -> str:
+    """Normalize a math answer string for comparison."""
+    if s is None:
+        return ""
+    s = s.strip()
+    if s.startswith("$") and s.endswith("$"):
+        s = s[1:-1].strip()
+    s = _re.sub(r"\\text\s*\{([^}]*)\}", r"\1", s)
+    s = _re.sub(r"\\mathrm\s*\{([^}]*)\}", r"\1", s)
+    for cmd in [r"\left", r"\right", r"\displaystyle", r"\tfrac", r"\dfrac"]:
+        s = s.replace(cmd, "")
+    for unit in [" cm", " m", " km", " kg", " g", " s", " ms",
+                 " degrees", " degree", "\u00b0", " inches", " feet",
+                 " square units", " units", " dollars"]:
+        if s.lower().rstrip(".").endswith(unit):
+            s = s[:len(s) - len(unit) - (1 if s.endswith(".") else 0)]
+    s = _re.sub(r"\s+", " ", s).strip()
+    s = s.rstrip(".,")
+    return s
+
+
+def _math_equiv(pred: str | None, gold: str | None) -> bool:
+    """Check if two math answers are equivalent."""
+    if pred is None or gold is None:
+        return False
+    p = _normalize_math(pred)
+    g = _normalize_math(gold)
+    if p == g:
+        return True
+    p_c = _re.sub(r"\s*\\frac", r"\\frac", p)
+    g_c = _re.sub(r"\s*\\frac", r"\\frac", g)
+    if p_c == g_c:
+        return True
+    try:
+        pf = float(p.replace(",", ""))
+        gf = float(g.replace(",", ""))
+        return abs(pf - gf) < 1e-6
+    except (ValueError, TypeError):
+        pass
+    mixed_pat = _re.compile(r"^(\d+)\s*\\frac\s*\{(\d+)\}\s*\{(\d+)\}$")
+    for s, other in [(p, g), (g, p)]:
+        m = mixed_pat.match(s)
+        if m:
+            try:
+                val = float(m.group(1)) + float(m.group(2)) / float(m.group(3))
+                oval = float(other.replace(",", ""))
+                if abs(val - oval) < 1e-6:
+                    return True
+            except (ValueError, ZeroDivisionError):
+                pass
+    frac_pat = _re.compile(r"\\?frac\s*\{([^}]+)\}\s*\{([^}]+)\}")
+    for s, other in [(p, g), (g, p)]:
+        m = frac_pat.search(s)
+        if m:
+            try:
+                val = float(m.group(1)) / float(m.group(2))
+                oval = float(other.replace(",", ""))
+                if abs(val - oval) < 1e-6:
+                    return True
+            except (ValueError, ZeroDivisionError):
+                pass
+    return False
+
+
+def _score_math_response(text: str, gold_answer: str) -> tuple[bool, str]:
+    """Score a Math500 response. Returns (correct, detail_str)."""
+    # Strip thinking block if present
+    think_end = text.rfind("</think>")
+    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+
+    pred = _extract_boxed(answer_text)
+    if not pred:
+        pred = _extract_boxed(text)
+
+    # Fallback: "the answer is **X**" patterns
+    if pred is None:
+        bold_pattern = _re.compile(
+            r'(?:answer\s+is|there\s+are|result\s+is|equals?|=)\s*\*\*(.+?)\*\*',
+            _re.IGNORECASE)
+        m = bold_pattern.search(answer_text)
+        if m:
+            pred = m.group(1).strip().rstrip(".")
+
+    # Fallback: last $...$ expression
+    if pred is None:
+        matches = _re.findall(r'\$([^$]+)\$', answer_text)
+        if matches:
+            pred = matches[-1].strip()
+
+    correct = _math_equiv(pred, gold_answer)
+    pred_short = (pred[:60] + "\u2026") if pred and len(pred) > 60 else pred
+    gold_short = (gold_answer[:60] + "\u2026") if len(gold_answer) > 60 else gold_answer
+    if correct:
+        detail = f"correct: {pred_short}"
+    elif pred:
+        detail = f"wrong: pred={pred_short} gold={gold_short}"
+    else:
+        detail = f"no answer found, gold={gold_short}"
+    return correct, detail
+
+
+# ── bench subcommand ────────────────────────────────────────────────────────
+
+BENCH_SUITES = ("he", "gsm", "math", "agent")
+BENCH_PROMPTS_DIR = Path(__file__).resolve().parent / "benchmarks" / "prompts"
+
+BENCH_SUITE_FILES = {
+    "he": "bench_he.jsonl",
+    "gsm": "bench_gsm.jsonl",
+    "math": "bench_math.jsonl",
+    "agent": "bench_agent.jsonl",
+}
+
+
+def _load_bench_prompts(suite: str, prompts_dir: Path | None = None) -> list[dict[str, Any]]:
+    """Load prompts for a bench suite from JSONL file."""
+    base = prompts_dir or BENCH_PROMPTS_DIR
+    path = base / BENCH_SUITE_FILES[suite]
+    if not path.exists():
+        raise HarnessError(f"bench prompt file not found: {path}")
+    cases = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                cases.append(json.loads(line))
+    return cases
+
+
+def _run_bench_case(
+    base_url: str,
+    model: str,
+    case: dict[str, Any],
+    *,
+    max_tokens_override: int | None = None,
+) -> dict[str, Any]:
+    """Run a single bench case via streaming to capture TTFT and detailed metrics.
+
+    Always uses streaming to get: walltime, TTFT, prompt_tokens, completion_tokens,
+    prefill tok/s, and decode tok/s (excluding prefill).
+    """
+    messages = case["messages"]
+    max_tokens = max_tokens_override or case.get("max_tokens", 256)
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        base_url + "/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+
+    t0 = time.perf_counter()
+    first_token_time = None
+    token_deltas = 0
+    text = ""
+    usage: dict[str, Any] = {}
+    status = 0
+
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            status = resp.status
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                # Capture usage from the final chunk
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                choices = obj.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    piece = (
+                        delta.get("content")
+                        or delta.get("reasoning_content")
+                        or ""
+                    )
+                    if piece:
+                        if first_token_time is None:
+                            first_token_time = time.perf_counter()
+                        token_deltas += 1
+                        text += str(piece)
+    except urllib.error.HTTPError as exc:
+        return {
+            "id": case["id"],
+            "ok": False,
+            "status": exc.code,
+            "error": exc.read().decode("utf-8", errors="replace")[-2000:],
+        }
+    except (urllib.error.URLError, TimeoutError, ConnectionResetError) as exc:
+        return {
+            "id": case["id"],
+            "ok": False,
+            "error": repr(exc),
+        }
+
+    wall_s = time.perf_counter() - t0
+    ttft_s = (first_token_time - t0) if first_token_time else None
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens") or token_deltas
+
+    # Compute derived metrics
+    prefill_tok_s = prompt_tokens / ttft_s if (ttft_s and ttft_s > 0 and prompt_tokens > 0) else None
+    decode_s = (wall_s - ttft_s) if ttft_s else None
+    output_tok_s = completion_tokens / decode_s if (decode_s and decode_s > 0 and completion_tokens > 0) else None
+
+    return {
+        "id": case["id"],
+        "ok": status == 200 and bool(text.strip()),
+        "text": text,
+        "wall_s": round(wall_s, 3),
+        "ttft_s": round(ttft_s, 4) if ttft_s else None,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "prefill_tok_s": round(prefill_tok_s, 1) if prefill_tok_s else None,
+        "output_tok_s": round(output_tok_s, 2) if output_tok_s else None,
+    }
+
+
+def _run_bench_suite(
+    suite: str,
+    base_url: str,
+    model: str,
+    n_sample: int | None,
+    prompts_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Run all prompts for a given bench suite."""
+    cases = _load_bench_prompts(suite, prompts_dir)
+    if n_sample is not None and n_sample < len(cases):
+        cases = cases[:n_sample]
+
+    results = []
+    n_correct, n_scored = 0, 0
+
+    print(f"\n[bench] === {suite.upper()} (n={len(cases)}) ===", flush=True)
+    print(f"  {'#':>3s}  {'id':<16s}  {'wall':>6s}  {'TTFT':>7s}  {'pf tok/s':>8s}  "
+          f"{'out_tok':>7s}  {'out tok/s':>9s}  {'score'}", flush=True)
+    print(f"  {'---':>3s}  {'---':<16s}  {'------':>6s}  {'-------':>7s}  {'--------':>8s}  "
+          f"{'-------':>7s}  {'---------':>9s}  {'-----'}", flush=True)
+
+    for i, case in enumerate(cases):
+        try:
+            result = _run_bench_case(base_url, model, case)
+        except Exception as exc:
+            result = {"id": case["id"], "ok": False, "error": repr(exc)}
+            print(f"  {i+1:3d}  {case['id']:<16s}  FAILED: {exc}", flush=True)
+            results.append(result)
+            continue
+
+        # Math500 correctness scoring
+        score_detail = ""
+        if suite == "math" and "gold_answer" in case and result.get("text"):
+            correct, detail = _score_math_response(result["text"], case["gold_answer"])
+            result["correct"] = correct
+            result["score_detail"] = detail
+            n_scored += 1
+            if correct:
+                n_correct += 1
+            score_detail = "OK" if correct else "WRONG"
+
+        # Format output line
+        wall_str = f"{result.get('wall_s', 0):.2f}s"
+        ttft = result.get("ttft_s")
+        ttft_str = f"{ttft:.3f}s" if ttft is not None else "n/a"
+        pf_tps = result.get("prefill_tok_s")
+        pf_str = f"{pf_tps:.2f}" if pf_tps is not None else "n/a"
+        out_tok = result.get("completion_tokens", 0)
+        out_tps = result.get("output_tok_s")
+        out_tps_str = f"{out_tps:.2f}" if out_tps is not None else "n/a"
+
+        print(
+            f"  {i+1:3d}  {case['id']:<16s}  {wall_str:>6s}  {ttft_str:>7s}  "
+            f"{pf_str:>8s}  {out_tok:>7d}  {out_tps_str:>9s}  {score_detail}",
+            flush=True,
+        )
+
+        results.append(result)
+
+    # Aggregate
+    ok_results = [r for r in results if r.get("ok")]
+    agg: dict[str, Any] = {
+        "suite": suite,
+        "n": len(cases),
+        "n_ok": len(ok_results),
+        "results": results,
+    }
+
+    if ok_results:
+        walls = [r["wall_s"] for r in ok_results]
+        ttfts = [r["ttft_s"] for r in ok_results if r.get("ttft_s") is not None]
+        pf_tps_list = [r["prefill_tok_s"] for r in ok_results if r.get("prefill_tok_s") is not None]
+        out_tps_list = [r["output_tok_s"] for r in ok_results if r.get("output_tok_s") is not None]
+        out_toks = [r["completion_tokens"] for r in ok_results]
+        prompt_toks = [r["prompt_tokens"] for r in ok_results]
+
+        agg["mean_wall_s"] = round(sum(walls) / len(walls), 3)
+        agg["mean_ttft_s"] = round(sum(ttfts) / len(ttfts), 4) if ttfts else None
+        agg["mean_prefill_tok_s"] = round(sum(pf_tps_list) / len(pf_tps_list), 1) if pf_tps_list else None
+        agg["mean_output_tok_s"] = round(sum(out_tps_list) / len(out_tps_list), 2) if out_tps_list else None
+        agg["total_output_tokens"] = sum(out_toks)
+        agg["total_prompt_tokens"] = sum(prompt_toks)
+
+        # Per-bucket aggregation for agent suite
+        if suite == "agent":
+            buckets: dict[str, list[dict[str, Any]]] = {}
+            for r in ok_results:
+                case_match = next((c for c in cases if c["id"] == r["id"]), None)
+                bucket = case_match.get("bucket", "unknown") if case_match else "unknown"
+                buckets.setdefault(bucket, []).append(r)
+            bucket_agg = {}
+            for bk, bk_results in sorted(buckets.items()):
+                bk_ttfts = [r["ttft_s"] for r in bk_results if r.get("ttft_s") is not None]
+                bk_pf = [r["prefill_tok_s"] for r in bk_results if r.get("prefill_tok_s") is not None]
+                bk_out = [r["output_tok_s"] for r in bk_results if r.get("output_tok_s") is not None]
+                bk_walls = [r["wall_s"] for r in bk_results]
+                bucket_agg[bk] = {
+                    "n": len(bk_results),
+                    "mean_ttft_s": round(sum(bk_ttfts) / len(bk_ttfts), 4) if bk_ttfts else None,
+                    "mean_prefill_tok_s": round(sum(bk_pf) / len(bk_pf), 1) if bk_pf else None,
+                    "mean_output_tok_s": round(sum(bk_out) / len(bk_out), 2) if bk_out else None,
+                    "mean_wall_s": round(sum(bk_walls) / len(bk_walls), 3),
+                }
+            agg["buckets"] = bucket_agg
+
+    if n_scored > 0:
+        agg["accuracy"] = f"{n_correct}/{n_scored}"
+        agg["accuracy_pct"] = round(n_correct / n_scored * 100, 1)
+
+    # Print suite summary
+    print(f"\n  [summary] ok={agg['n_ok']}/{agg['n']}", end="", flush=True)
+    if agg.get("mean_wall_s"):
+        print(f"  wall={agg['mean_wall_s']:.2f}s", end="")
+    if agg.get("mean_ttft_s"):
+        print(f"  TTFT={agg['mean_ttft_s']:.3f}s", end="")
+    if agg.get("mean_prefill_tok_s"):
+        print(f"  prefill={agg['mean_prefill_tok_s']:.2f} tok/s", end="")
+    if agg.get("mean_output_tok_s"):
+        print(f"  output={agg['mean_output_tok_s']:.2f} tok/s", end="")
+    if n_scored > 0:
+        print(f"  accuracy={agg['accuracy']} ({agg['accuracy_pct']}%)", end="")
+    print(flush=True)
+
+    return agg
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Run benchmark suites against a running server."""
+    base_url = args.url.rstrip("/")
+    model = args.model
+    n_sample = args.n_sample if args.n_sample else None
+
+    # Parse suite selection
+    if args.suite == "all":
+        selected = list(BENCH_SUITES)
+    else:
+        selected = [s.strip() for s in args.suite.split(",")]
+        unknown = [s for s in selected if s not in BENCH_SUITES]
+        if unknown:
+            raise SystemExit(f"unknown suite(s): {', '.join(unknown)}; choices: {', '.join(BENCH_SUITES)}")
+
+    # Check server health first
+    try:
+        status, _body, _elapsed = http_json("GET", base_url + "/health", timeout=10)
+        if status != 200:
+            print(f"[bench] WARNING: server health check returned {status}", flush=True)
+    except Exception as exc:
+        raise SystemExit(f"[bench] cannot reach server at {base_url}/health: {exc}")
+
+    print(f"[bench] url={base_url}  model={model}  suites={','.join(selected)}", flush=True)
+
+    all_suites: dict[str, Any] = {}
+    for suite in selected:
+        all_suites[suite] = _run_bench_suite(
+            suite, base_url, model, n_sample,
+            prompts_dir=Path(args.prompts_dir) if args.prompts_dir else None,
+        )
+
+    payload = {
+        "command": "bench",
+        "url": base_url,
+        "model": model,
+        "suites": all_suites,
+        "ok": all(s.get("n_ok", 0) > 0 for s in all_suites.values()),
+    }
+
+    # Final summary
+    print(f"\n[bench] === SUMMARY ===", flush=True)
+    print(f"{'Suite':>8s}  {'OK':>5s}  {'Wall':>7s}  {'TTFT':>7s}  {'Pf tok/s':>9s}  "
+          f"{'Out tok/s':>10s}  {'Out tok':>8s}  {'Score':>10s}", flush=True)
+    for suite, s in all_suites.items():
+        ok_str = f"{s['n_ok']}/{s['n']}"
+        wall_str = f"{s.get('mean_wall_s', 0):.2f}s" if s.get("mean_wall_s") else "-"
+        ttft_str = f"{s['mean_ttft_s']:.3f}s" if s.get("mean_ttft_s") else "-"
+        pf_str = f"{s['mean_prefill_tok_s']:.2f}" if s.get("mean_prefill_tok_s") else "-"
+        out_str = f"{s['mean_output_tok_s']:.2f}" if s.get("mean_output_tok_s") else "-"
+        tok_str = str(s.get("total_output_tokens", 0))
+        score_str = s.get("accuracy", "-")
+        print(f"{suite:>8s}  {ok_str:>5s}  {wall_str:>7s}  {ttft_str:>7s}  "
+              f"{pf_str:>9s}  {out_str:>10s}  {tok_str:>8s}  {score_str:>10s}", flush=True)
+
+    write_json(args.json_out, payload)
+    return 0 if payload["ok"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
@@ -1400,6 +1846,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("json_in", nargs="+", type=Path)
     p_report.add_argument("--json-out", type=Path, default=None)
     p_report.set_defaults(func=cmd_report)
+
+    p_bench = sub.add_parser("bench", help="Run benchmark suites (he, gsm, math, agent)")
+    p_bench.add_argument("--url", required=True, help="Server base URL")
+    p_bench.add_argument("--suite", default="all",
+                         help="Comma-separated suites: he,gsm,math,agent (default: all)")
+    p_bench.add_argument("--model", default=MODEL, help="Model name")
+    p_bench.add_argument("--n-sample", type=int, default=None,
+                         help="Max prompts per suite (default: all)")
+    p_bench.add_argument("--prompts-dir", default=None,
+                         help="Override prompts directory")
+    p_bench.add_argument("--json-out", type=Path, default=None)
+    p_bench.set_defaults(func=cmd_bench)
+
     return ap
 
 
