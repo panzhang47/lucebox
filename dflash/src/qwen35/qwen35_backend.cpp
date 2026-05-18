@@ -640,18 +640,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     const DaemonIO & io) {
     const int hidden = w_.n_embd;
 
-    // Sample first token from prefill's last-position argmax.
-    // The last chunk used last_token_logits_only=false, so sg_.argmax_tokens
-    // holds argmax for ALL positions in that chunk. We need the LAST position.
-    int32_t last_tok;
-    {
-        const int PREFILL_UBATCH = 512;
-        int n_last_chunk = committed % PREFILL_UBATCH;
-        if (n_last_chunk == 0) n_last_chunk = PREFILL_UBATCH;
-        ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok,
-                                sizeof(int32_t) * (n_last_chunk - 1),
-                                sizeof(int32_t));
-    }
+    // First token = prefill's last-position argmax. do_prefill already read it
+    // into cache_.last_tok using the correct per-chunk offset. Re-reading
+    // sg_.argmax_tokens here with a hardcoded ubatch indexed it by
+    // `committed % 512`, which overruns the decode-step argmax tensor for any
+    // prompt longer than that tensor (issue #191: ggml "tensor read out of
+    // bounds" -> daemon abort on the first real-sized request).
+    int32_t last_tok = cache_.last_tok;
 
     // Check if we can use speculative decode:
     // - draft model loaded and not parked
