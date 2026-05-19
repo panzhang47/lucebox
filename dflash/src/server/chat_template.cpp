@@ -1,0 +1,158 @@
+// Chat template renderer implementation.
+
+#include "chat_template.h"
+
+namespace dflash27b {
+
+// Qwen3.5 tool preamble — matches the official Jinja template exactly.
+static const char QWEN3_TOOL_PREAMBLE[] =
+    "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+
+static const char QWEN3_TOOL_SUFFIX[] =
+    "\n</tools>\n\n"
+    "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+    "<tool_call>\n"
+    "<function=example_function_name>\n"
+    "<parameter=example_parameter_1>\n"
+    "value_1\n"
+    "</parameter>\n"
+    "<parameter=example_parameter_2>\n"
+    "This is the value for the second parameter\n"
+    "that can span\n"
+    "multiple lines\n"
+    "</parameter>\n"
+    "</function>\n"
+    "</tool_call>\n\n"
+    "<IMPORTANT>\n"
+    "Reminder:\n"
+    "- Function calls MUST follow the specified format: an inner <function=...></function> "
+    "block must be nested within <tool_call></tool_call> XML tags\n"
+    "- Required parameters MUST be specified\n"
+    "- You may provide optional reasoning for your function call in natural language "
+    "BEFORE the function call, but NOT after\n"
+    "- If there is no function call available, answer the question like normal with your "
+    "current knowledge and do not tell the user about function calls\n"
+    "</IMPORTANT>";
+
+ChatFormat chat_format_for_arch(const std::string & arch) {
+    if (arch == "laguna") return ChatFormat::LAGUNA;
+    // qwen35, qwen3, gemma4 all use the Qwen3/ChatML format
+    return ChatFormat::QWEN3;
+}
+
+std::string render_chat_template(
+    const std::vector<ChatMessage> & messages,
+    ChatFormat format,
+    bool add_generation_prompt,
+    bool enable_thinking,
+    const std::string & tools_json)
+{
+    std::string result;
+    bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
+
+    switch (format) {
+    case ChatFormat::QWEN3: {
+        // Qwen3/3.5 ChatML format:
+        //   <|im_start|>system\n[tool preamble +] content<|im_end|>\n
+        //   <|im_start|>user\nHello<|im_end|>\n
+        //   <|im_start|>assistant\n...
+
+        // Determine if the first message is a system message.
+        size_t start_idx = 0;
+        std::string system_content;
+        if (!messages.empty() && messages[0].role == "system") {
+            system_content = messages[0].content;
+            start_idx = 1;
+        }
+
+        // Emit system message with tool preamble if tools are present.
+        if (has_tools) {
+            result += "<|im_start|>system\n";
+            result += QWEN3_TOOL_PREAMBLE;
+            result += '\n';
+            result += tools_json;
+            result += QWEN3_TOOL_SUFFIX;
+            if (!system_content.empty()) {
+                result += "\n\n";
+                result += system_content;
+            }
+            result += "<|im_end|>\n";
+        } else if (!system_content.empty()) {
+            result += "<|im_start|>system\n";
+            result += system_content;
+            result += "<|im_end|>\n";
+        }
+
+        // Render remaining messages.
+        bool in_tool_response = false;
+        for (size_t i = start_idx; i < messages.size(); i++) {
+            const auto & msg = messages[i];
+
+            if (msg.role == "tool") {
+                // Qwen3.5 template: tool responses are grouped inside a user
+                // message wrapped in <tool_response> tags.
+                if (!in_tool_response) {
+                    result += "<|im_start|>user";
+                    in_tool_response = true;
+                }
+                result += "\n<tool_response>\n";
+                result += msg.content;
+                result += "\n</tool_response>";
+                // Close user block if next message is not a tool message.
+                bool next_is_tool = (i + 1 < messages.size() &&
+                                     messages[i + 1].role == "tool");
+                if (!next_is_tool) {
+                    result += "<|im_end|>\n";
+                    in_tool_response = false;
+                }
+            } else {
+                result += "<|im_start|>";
+                result += msg.role;
+                result += '\n';
+                result += msg.content;
+                result += "<|im_end|>\n";
+            }
+        }
+
+        if (add_generation_prompt) {
+            result += "<|im_start|>assistant\n";
+            if (!enable_thinking) {
+                // Qwen3 thinking disabled: inject closed think block so the
+                // model skips reasoning and generates the answer directly.
+                result += "<think>\n\n</think>\n\n";
+            }
+        }
+        break;
+    }
+
+    case ChatFormat::LAGUNA: {
+        // Laguna/DeepSeek format:
+        //   <｜begin▁of▁sentence｜>system content
+        //   <｜User｜>user content<｜Assistant｜>
+        result = "<｜begin▁of▁sentence｜>";
+        for (const auto & msg : messages) {
+            if (msg.role == "system") {
+                result += msg.content;
+            } else if (msg.role == "user") {
+                result += "<｜User｜>";
+                result += msg.content;
+            } else if (msg.role == "assistant") {
+                result += "<｜Assistant｜>";
+                result += msg.content;
+            } else if (msg.role == "tool") {
+                // Tool results inline as user content
+                result += "<｜User｜>[tool_result:" + msg.tool_call_id + "]\n";
+                result += msg.content;
+            }
+        }
+        if (add_generation_prompt) {
+            result += "<｜Assistant｜>";
+        }
+        break;
+    }
+    }
+
+    return result;
+}
+
+}  // namespace dflash27b

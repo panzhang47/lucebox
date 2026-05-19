@@ -185,7 +185,7 @@ struct LagunaCacheSnapshot {
 bool laguna_snapshot_alloc(const LagunaTargetCache & cache,
                             ggml_backend_t            backend,
                             int                       n_layer,
-                            int                       max_ctx,
+                            int                       snap_pos,
                             int                       n_head_kv,
                             int                       head_dim,
                             LagunaCacheSnapshot &     out);
@@ -193,6 +193,10 @@ bool laguna_snapshot_alloc(const LagunaTargetCache & cache,
 void laguna_snapshot_free(LagunaCacheSnapshot & snap);
 
 bool laguna_snapshot_save(const LagunaTargetCache & cache,
+                           ggml_backend_t            backend,
+                           int                       n_layer,
+                           int                       n_head_kv,
+                           int                       head_dim,
                            LagunaCacheSnapshot &     snap);
 
 bool laguna_snapshot_restore(const LagunaCacheSnapshot & snap,

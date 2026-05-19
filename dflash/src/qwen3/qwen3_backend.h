@@ -118,7 +118,7 @@ private:
     std::mt19937_64       sampler_rng_{std::random_device{}()};
 
     // Snapshots
-    static constexpr int PREFIX_SLOTS = 8;
+    static constexpr int PREFIX_SLOTS = 64;
     Qwen3Snapshot         snapshots_[PREFIX_SLOTS];
 
     // Step forward: run n_tokens through all layers, write K/V into cache,

@@ -21,6 +21,8 @@ namespace dflash27b {
 //   lm_head: optional target lm_head tensor for fused projection. When
 //   nullptr, the draft graph emits hidden states only and the caller is
 //   responsible for projection (e.g. via build_lm_head_step on the target).
+//   ctx_len_max: upper bound on ctx_len across all future calls (used to
+//   pre-size allocations so gallocr never needs to reallocate).
 bool build_draft_step(
     StepGraph & sg,
     const DraftWeights & dw,
@@ -28,6 +30,7 @@ bool build_draft_step(
     ggml_backend_t backend,
     int ctx_len,
     const DraftFeatureMirror * mirror = nullptr,
-    int committed = 0);
+    int committed = 0,
+    int ctx_len_max = 0);
 
 }  // namespace dflash27b

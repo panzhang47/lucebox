@@ -48,10 +48,10 @@ bool build_layer_step(
         ggml_set_input(sg.positions);
 
         if (with_mask) {
-            const int win_start_l = (fa_window > 0 && kv_start > fa_window)
-                                        ? (kv_start - fa_window) : 0;
-            const int win_len_l = kv_start + n_tokens - win_start_l;
-            const int kv_pad = align_up(win_len_l, kq_stride_pad);
+            // Use max_ctx for allocation so gallocr buffer doesn't grow
+            // as kv_start advances during chunked prefill.
+            const int max_win_len = cache.max_ctx + n_tokens;
+            const int kv_pad = align_up(max_win_len, kq_stride_pad);
             const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
             sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
             ggml_set_name(sg.attn_mask, "attn_mask");
@@ -112,9 +112,11 @@ bool build_target_step(
     ggml_set_input(sg.positions);
 
     if (with_mask) {
-        const int win_start = (fa_window > 0 && kv_start > fa_window) ? (kv_start - fa_window) : 0;
-        const int win_len = kv_start + n_tokens - win_start;
-        const int kv_pad = align_up(win_len, kq_stride_pad);
+        // Use max_ctx for mask allocation so the gallocr buffer never needs to
+        // grow as kv_start increases during generation.  The actual mask is
+        // filled only up to kv_start + n_tokens; the excess is don't-care.
+        const int max_win_len = cache.max_ctx + n_tokens;
+        const int kv_pad = align_up(max_win_len, kq_stride_pad);
         const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
         ggml_set_name(sg.attn_mask, "attn_mask");

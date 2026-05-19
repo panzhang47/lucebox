@@ -11,6 +11,7 @@
 #include "dflash27b.h"
 
 #include "ggml-cuda.h"
+#include "common/snapshot_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -33,6 +34,13 @@ bool LagunaBackend::init() {
     backend_ = ggml_backend_cuda_init(0);
     if (!backend_) {
         std::fprintf(stderr, "cuda init failed\n");
+        return false;
+    }
+
+    snap_backend_ = create_snapshot_backend(backend_);
+    if (!snap_backend_) {
+        std::fprintf(stderr, "snapshot backend init failed\n");
+        ggml_backend_free(backend_); backend_ = nullptr;
         return false;
     }
 
@@ -104,20 +112,13 @@ bool LagunaBackend::ensure_slot(int slot) {
         std::fprintf(stderr, "[snap] target parked, cannot allocate snapshot\n");
         return false;
     }
-    if (!snapshots_[slot].ctx) {
-        if (!laguna_snapshot_alloc(cache_, backend_, w_.n_layer, args_.max_ctx,
-                                    w_.n_head_kv, w_.head_dim, snapshots_[slot])) {
-            std::fprintf(stderr, "[snap] alloc slot=%d: %s\n", slot,
-                          dflash27b_last_error());
-            return false;
-        }
-    }
     return true;
 }
 
 bool LagunaBackend::snapshot_save(int slot) {
     if (!ensure_slot(slot)) return false;
-    if (!laguna_snapshot_save(cache_, snapshots_[slot])) {
+    if (!laguna_snapshot_save(cache_, snap_backend_, w_.n_layer,
+                               w_.n_head_kv, w_.head_dim, snapshots_[slot])) {
         std::fprintf(stderr, "[snap] save slot=%d: %s\n",
                       slot, dflash27b_last_error());
         return false;
@@ -183,7 +184,8 @@ GenerateResult LagunaBackend::generate(const GenerateRequest & req,
     // ── Inline snapshot (if requested) ──
     if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos <= N) {
         if (ensure_slot(req.snap_slot) &&
-            laguna_snapshot_save(cache_, snapshots_[req.snap_slot])) {
+            laguna_snapshot_save(cache_, snap_backend_, w_.n_layer,
+                                  w_.n_head_kv, w_.head_dim, snapshots_[req.snap_slot])) {
             snapshots_[req.snap_slot].cur_pos = req.snap_pos;
             std::printf("[snap] inline slot=%d cur_pos=%d\n",
                          req.snap_slot, req.snap_pos);
@@ -414,6 +416,8 @@ void LagunaBackend::shutdown() {
         free_laguna_target_cache(cache_);
         free_laguna_target_weights(w_);
     }
+    free_snapshot_backend(snap_backend_, backend_);
+    snap_backend_ = nullptr;
     if (backend_) {
         ggml_backend_free(backend_);
         backend_ = nullptr;

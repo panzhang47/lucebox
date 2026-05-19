@@ -357,7 +357,9 @@ struct PrefixSnapshot {
     int       max_ctx         = 0;                 // for sanity check at restore
     int       target_feat_cap = 0;
 
-    // GPU-resident copies (lazy-allocated; null until first snapshot)
+    // Snap-backend-resident copies (lazy-allocated; null until first snapshot).
+    // On discrete GPUs these live on the CPU backend to avoid VRAM pressure;
+    // on unified-memory platforms they stay on the compute backend.
     std::vector<ggml_tensor *> attn_k_snap;     // size n_full_attn (16)
     std::vector<ggml_tensor *> attn_v_snap;
     std::vector<ggml_tensor *> ssm_state_snap;  // size n_delta (48)
@@ -378,10 +380,11 @@ struct PrefixSnapshot {
     //     allocated (THIN snapshots are KV-only).
 };
 
-// Snapshot the slim state of `cache` into `snap`. Allocates device buffers
-// on the first call (lazy; matches the cache's own allocation pattern).
-// Subsequent calls REUSE the same buffers (just refresh contents). Returns
-// false on allocation failure (and sets last_error).
+// Snapshot the slim state of `cache` into `snap`. KV tensors are RIGHT-SIZED
+// to cache.cur_pos (not max_ctx) to minimize memory. Buffers are reused when
+// cur_pos matches the previous snapshot; otherwise freed and reallocated
+// (right-sized allocations are tiny — KB for short prefixes). Returns false
+// on allocation failure (and sets last_error).
 bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,

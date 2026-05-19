@@ -1195,9 +1195,20 @@ bool snapshot_target_cache(const TargetWeights & w,
                            PrefixSnapshot & snap) {
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
     const int n_delta     = w.n_layer - n_full_attn;               // 48
+    const int snap_pos    = cache.cur_pos;
 
-    // Lazy allocation: only allocate on the first call.
-    if (snap.ctx == nullptr) {
+    if (snap_pos <= 0) {
+        set_last_error("snapshot_target_cache: cur_pos <= 0");
+        return false;
+    }
+
+    // Reuse existing buffer if shapes match (same cur_pos); otherwise reallocate.
+    // Right-sized KV tensors use [head_dim, cur_pos, n_head_kv] — orders of
+    // magnitude smaller than [head_dim, max_ctx, n_head_kv] for short prefixes.
+    const bool needs_alloc = (snap.ctx == nullptr) || (snap.cur_pos != snap_pos);
+    if (needs_alloc) {
+        free_prefix_snapshot(snap);
+
         const int total_tensors = 2 * n_full_attn + 2 * n_delta + 1; // 65
         ggml_init_params ip{};
         ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
@@ -1211,12 +1222,12 @@ bool snapshot_target_cache(const TargetWeights & w,
         snap.ssm_state_snap.assign(n_delta, nullptr);
         snap.conv_state_snap.assign(n_delta, nullptr);
 
-        // Allocate KV snap tensors matching the cache's shapes and types.
+        // Right-sized KV: [head_dim, snap_pos, n_head_kv]
         for (int i = 0; i < n_full_attn; i++) {
             ggml_tensor * sk = cache.attn_k[i];
             ggml_tensor * sv = cache.attn_v[i];
-            ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], sk->ne[1], sk->ne[2]);
-            ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], sv->ne[1], sv->ne[2]);
+            ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], snap_pos, sk->ne[2]);
+            ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], snap_pos, sv->ne[2]);
             char name[64];
             std::snprintf(name, sizeof(name), "snap_cache_k_%d", i); ggml_set_name(K, name);
             std::snprintf(name, sizeof(name), "snap_cache_v_%d", i); ggml_set_name(V, name);
@@ -1224,7 +1235,7 @@ bool snapshot_target_cache(const TargetWeights & w,
             snap.attn_v_snap[i] = V;
         }
 
-        // Allocate SSM and conv snap tensors.
+        // SSM / conv: full-size (position-independent recurrent state).
         for (int i = 0; i < n_delta; i++) {
             ggml_tensor * ss = cache.ssm_state[i];
             ggml_tensor * cs = cache.conv_state[i];
@@ -1237,10 +1248,11 @@ bool snapshot_target_cache(const TargetWeights & w,
             snap.conv_state_snap[i] = C;
         }
 
-        // Allocate target_feat snap tensor.
+        // Right-sized target_feat: [fc_in, min(snap_pos, target_feat_cap)]
         {
             ggml_tensor * tf = cache.target_feat;
-            snap.target_feat_snap = ggml_new_tensor_2d(snap.ctx, tf->type, tf->ne[0], tf->ne[1]);
+            const int feat_len = std::min(snap_pos, cache.target_feat_cap);
+            snap.target_feat_snap = ggml_new_tensor_2d(snap.ctx, tf->type, tf->ne[0], feat_len);
             ggml_set_name(snap.target_feat_snap, "snap_target_feat");
         }
 
@@ -1256,20 +1268,45 @@ bool snapshot_target_cache(const TargetWeights & w,
             snap.target_feat_snap = nullptr;
             return false;
         }
+        std::fprintf(stderr, "[snap] alloc right-sized: cur_pos=%d buf=%.2f MiB backend=%s\n",
+                     snap_pos,
+                     (double)ggml_backend_buffer_get_size(snap.buf) / 1024.0 / 1024.0,
+                     ggml_backend_name(backend));
     }
 
-    // Copy live cache tensors into snapshot (works for both first call and refreshes).
+    // Copy KV strip-by-strip (right-sized snapshot is smaller than cache).
     for (int i = 0; i < n_full_attn; i++) {
-        ggml_backend_tensor_copy(cache.attn_k[i], snap.attn_k_snap[i]);
-        ggml_backend_tensor_copy(cache.attn_v[i], snap.attn_v_snap[i]);
+        ggml_tensor * sk = cache.attn_k[i];
+        ggml_tensor * dk = snap.attn_k_snap[i];
+        ggml_tensor * sv = cache.attn_v[i];
+        ggml_tensor * dv = snap.attn_v_snap[i];
+        const size_t k_strip = (size_t)snap_pos * sk->nb[1];
+        const size_t v_strip = (size_t)snap_pos * sv->nb[1];
+        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sk->nb[2];
+            size_t dst_off = (size_t)kh * dk->nb[2];
+            ggml_backend_tensor_get(sk, (char *)dk->data + dst_off, src_off, k_strip);
+        }
+        for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sv->nb[2];
+            size_t dst_off = (size_t)kh * dv->nb[2];
+            ggml_backend_tensor_get(sv, (char *)dv->data + dst_off, src_off, v_strip);
+        }
     }
+
+    // SSM/conv: full copy (fixed-size, same shapes).
     for (int i = 0; i < n_delta; i++) {
         ggml_backend_tensor_copy(cache.ssm_state[i],  snap.ssm_state_snap[i]);
         ggml_backend_tensor_copy(cache.conv_state[i], snap.conv_state_snap[i]);
     }
-    ggml_backend_tensor_copy(cache.target_feat, snap.target_feat_snap);
 
-    snap.cur_pos         = cache.cur_pos;
+    // target_feat: partial copy of first min(snap_pos, cap) rows.
+    {
+        const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
+        ggml_backend_tensor_get(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
+    }
+
+    snap.cur_pos         = snap_pos;
     snap.last_tok        = cache.last_tok;
     snap.kv_k_type       = cache.kv_k_type;
     snap.max_ctx         = cache.max_ctx;
@@ -1305,16 +1342,39 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
 
     const int n_full_attn = (int)snap.attn_k_snap.size();
     const int n_delta     = (int)snap.ssm_state_snap.size();
+    const int snap_pos    = snap.cur_pos;
 
+    // KV: strip-by-strip copy from right-sized snapshot into full-size cache.
     for (int i = 0; i < n_full_attn; i++) {
-        ggml_backend_tensor_copy(snap.attn_k_snap[i], cache.attn_k[i]);
-        ggml_backend_tensor_copy(snap.attn_v_snap[i], cache.attn_v[i]);
+        ggml_tensor * sk = snap.attn_k_snap[i];
+        ggml_tensor * dk = cache.attn_k[i];
+        ggml_tensor * sv = snap.attn_v_snap[i];
+        ggml_tensor * dv = cache.attn_v[i];
+        const size_t k_strip = (size_t)snap_pos * sk->nb[1];
+        const size_t v_strip = (size_t)snap_pos * sv->nb[1];
+        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sk->nb[2];
+            size_t dst_off = (size_t)kh * dk->nb[2];
+            ggml_backend_tensor_set(dk, (const char *)sk->data + src_off, dst_off, k_strip);
+        }
+        for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sv->nb[2];
+            size_t dst_off = (size_t)kh * dv->nb[2];
+            ggml_backend_tensor_set(dv, (const char *)sv->data + src_off, dst_off, v_strip);
+        }
     }
+
+    // SSM/conv: full copy (fixed-size).
     for (int i = 0; i < n_delta; i++) {
         ggml_backend_tensor_copy(snap.ssm_state_snap[i],  cache.ssm_state[i]);
         ggml_backend_tensor_copy(snap.conv_state_snap[i], cache.conv_state[i]);
     }
-    ggml_backend_tensor_copy(snap.target_feat_snap, cache.target_feat);
+
+    // target_feat: partial copy of stored rows.
+    {
+        const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
+        ggml_backend_tensor_set(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
+    }
 
     cache.cur_pos  = snap.cur_pos;
     cache.last_tok = snap.last_tok;

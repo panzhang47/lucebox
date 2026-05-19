@@ -154,7 +154,8 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                 draft_feature_mirror_can_view(feature_ring, committed, ctx_len, mirror_slot0);
             if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, backend,
                                   ctx_len, use_mirror_view ? &feature_ring : nullptr,
-                                  committed)) {
+                                  committed,
+                                  /*ctx_len_max=*/feature_ring.cap)) {
                 std::fprintf(stderr, "[draft-ipc-daemon] draft build failed\n");
                 stream_status(stream_fd, -1);
                 continue;

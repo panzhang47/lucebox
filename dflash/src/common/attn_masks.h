@@ -25,11 +25,16 @@ inline int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 // attending to kv_len keys starting at kv_start.
 // kq_stride_pad: alignment for kv dimension (32 for F16/Q8, 256 for TurboQuant).
 // win_start: optional window start for sliding-window attention.
+// kv_pad_override: when >0, overrides the kv_pad (row stride) calculation.
+//   Use this when the mask tensor is pre-sized to max_ctx to avoid gallocr
+//   reallocation.  The excess positions are filled with -inf.
 inline void build_causal_mask(std::vector<uint16_t> & out,
                               int kv_len, int n_tokens, int kv_start,
                               int kq_stride_pad,
-                              int win_start = 0) {
-    const int kv_pad = align_up(kv_len, kq_stride_pad);
+                              int win_start = 0,
+                              int kv_pad_override = 0) {
+    const int kv_pad = (kv_pad_override > 0) ? kv_pad_override
+                                             : align_up(kv_len, kq_stride_pad);
     const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
     out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
     const int abs_end = win_start + kv_len;

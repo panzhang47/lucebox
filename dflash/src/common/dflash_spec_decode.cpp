@@ -91,7 +91,8 @@ bool run_dflash_spec_decode(
         } else {
             if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, draft_backend,
                                   draft_ctx, use_mirror_view ? &feature_ring : nullptr,
-                                  committed)) {
+                                  committed,
+                                  /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, draft_ctx_max)))) {
                 std::fprintf(stderr, "dflash-spec draft build failed\n");
                 return false;
             }

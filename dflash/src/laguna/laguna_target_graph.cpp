@@ -101,13 +101,12 @@ bool create_laguna_target_cache(const LagunaTargetWeights & w,
 
 // ---- Cache snapshot helpers (prefix-cache slots) ------------------------
 //
-// laguna_snapshot_alloc: build a parallel set of K/V tensors with the same
-// shapes and dtypes as the live cache, allocated on a fresh ggml backend
-// buffer. Idempotent — calling on an already-allocated snapshot is a no-op.
+// laguna_snapshot_alloc: build a parallel set of K/V tensors RIGHT-SIZED to
+// snap_pos positions (not full max_ctx). Position dimension is ne[1].
 bool laguna_snapshot_alloc(const LagunaTargetCache & cache,
                             ggml_backend_t            backend,
                             int                       n_layer,
-                            int                       max_ctx,
+                            int                       snap_pos,
                             int                       n_head_kv,
                             int                       head_dim,
                             LagunaCacheSnapshot &     out) {
@@ -122,10 +121,11 @@ bool laguna_snapshot_alloc(const LagunaTargetCache & cache,
     for (int il = 0; il < n_layer; ++il) {
         char nm[32];
         std::snprintf(nm, sizeof(nm), "snap_k_l%d", il);
-        ggml_tensor * k = ggml_new_tensor_3d(out.ctx, cache.kv_k_type, head_dim, max_ctx, n_head_kv);
+        // Right-sized: [head_dim, snap_pos, n_head_kv]
+        ggml_tensor * k = ggml_new_tensor_3d(out.ctx, cache.kv_k_type, head_dim, snap_pos, n_head_kv);
         ggml_set_name(k, nm);
         std::snprintf(nm, sizeof(nm), "snap_v_l%d", il);
-        ggml_tensor * v = ggml_new_tensor_3d(out.ctx, cache.kv_v_type, head_dim, max_ctx, n_head_kv);
+        ggml_tensor * v = ggml_new_tensor_3d(out.ctx, cache.kv_v_type, head_dim, snap_pos, n_head_kv);
         ggml_set_name(v, nm);
         out.attn_k[il] = k;
         out.attn_v[il] = v;
@@ -150,19 +150,49 @@ void laguna_snapshot_free(LagunaCacheSnapshot & snap) {
     snap.used    = false;
 }
 
-// Device-to-device copy live cache -> snapshot. Snapshot must already be
-// allocated with matching shapes via laguna_snapshot_alloc.
+// Save cache → snapshot. Handles alloc/realloc internally.
 bool laguna_snapshot_save(const LagunaTargetCache & cache,
+                           ggml_backend_t            backend,
+                           int                       n_layer,
+                           int                       n_head_kv,
+                           int                       head_dim,
                            LagunaCacheSnapshot &     snap) {
-    if (!snap.ctx || snap.attn_k.size() != cache.attn_k.size()) {
-        set_last_error("snapshot_save: snapshot not allocated or layer count mismatch");
+    const int snap_pos = cache.cur_pos;
+    if (snap_pos <= 0) {
+        set_last_error("snapshot_save: cur_pos <= 0");
         return false;
     }
-    for (size_t il = 0; il < cache.attn_k.size(); ++il) {
-        ggml_backend_tensor_copy(cache.attn_k[il], snap.attn_k[il]);
-        ggml_backend_tensor_copy(cache.attn_v[il], snap.attn_v[il]);
+
+    // Realloc if shapes don't match (different cur_pos).
+    if (snap.ctx && snap.cur_pos != snap_pos) {
+        laguna_snapshot_free(snap);
     }
-    snap.cur_pos = cache.cur_pos;
+    if (!snap.ctx) {
+        if (!laguna_snapshot_alloc(cache, backend, n_layer, snap_pos, n_head_kv, head_dim, snap)) {
+            return false;
+        }
+    }
+
+    // Copy KV strip-by-strip (right-sized snapshot, position dim = ne[1]).
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor * sk = cache.attn_k[il];
+        ggml_tensor * dk = snap.attn_k[il];
+        ggml_tensor * sv = cache.attn_v[il];
+        ggml_tensor * dv = snap.attn_v[il];
+        const size_t k_strip = (size_t)snap_pos * sk->nb[1];
+        const size_t v_strip = (size_t)snap_pos * sv->nb[1];
+        for (int kh = 0; kh < n_head_kv; kh++) {
+            size_t src_off = (size_t)kh * sk->nb[2];
+            size_t dst_off = (size_t)kh * dk->nb[2];
+            ggml_backend_tensor_get(sk, (char *)dk->data + dst_off, src_off, k_strip);
+        }
+        for (int kh = 0; kh < n_head_kv; kh++) {
+            size_t src_off = (size_t)kh * sv->nb[2];
+            size_t dst_off = (size_t)kh * dv->nb[2];
+            ggml_backend_tensor_get(sv, (char *)dv->data + dst_off, src_off, v_strip);
+        }
+    }
+    snap.cur_pos = snap_pos;
     snap.used    = true;
     return true;
 }
@@ -173,11 +203,27 @@ bool laguna_snapshot_restore(const LagunaCacheSnapshot & snap,
         set_last_error("snapshot_restore: snapshot unused or layer count mismatch");
         return false;
     }
+    const int snap_pos = snap.cur_pos;
+    // Copy right-sized snapshot back into full-size cache, strip-by-strip.
     for (size_t il = 0; il < cache.attn_k.size(); ++il) {
-        ggml_backend_tensor_copy(snap.attn_k[il], cache.attn_k[il]);
-        ggml_backend_tensor_copy(snap.attn_v[il], cache.attn_v[il]);
+        ggml_tensor * sk = snap.attn_k[il];
+        ggml_tensor * dk = cache.attn_k[il];
+        ggml_tensor * sv = snap.attn_v[il];
+        ggml_tensor * dv = cache.attn_v[il];
+        const size_t k_strip = (size_t)snap_pos * sk->nb[1];
+        const size_t v_strip = (size_t)snap_pos * sv->nb[1];
+        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sk->nb[2];
+            size_t dst_off = (size_t)kh * dk->nb[2];
+            ggml_backend_tensor_set(dk, (const char *)sk->data + src_off, dst_off, k_strip);
+        }
+        for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sv->nb[2];
+            size_t dst_off = (size_t)kh * dv->nb[2];
+            ggml_backend_tensor_set(dv, (const char *)sv->data + src_off, dst_off, v_strip);
+        }
     }
-    cache.cur_pos = snap.cur_pos;
+    cache.cur_pos = snap_pos;
     return true;
 }
 

@@ -72,8 +72,9 @@ bool Qwen35DFlashTarget::verify_batch(
                                   ? (base_pos - fa_window_) : 0;
         const int kv_len = base_pos + n_tokens - win_start;
         std::vector<uint16_t> mask_buf;
+        const int kv_pad_override = (int)sg_.attn_mask->ne[0];
         build_causal_mask(mask_buf, kv_len, n_tokens, base_pos,
-                          kq_stride_pad_, win_start);
+                          kq_stride_pad_, win_start, kv_pad_override);
         ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
                                 sizeof(uint16_t) * mask_buf.size());
     }

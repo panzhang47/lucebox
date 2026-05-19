@@ -12,6 +12,8 @@ TARGET="${TARGET:-$REPO_DIR/dflash/models/Qwen3.6-27B-Q4_K_M.gguf}"
 DRAFT="${DRAFT:-$REPO_DIR/dflash/models/draft/dflash-draft-3.6-q8_0.gguf}"
 DFLASH_BIN="${DFLASH_BIN:-$REPO_DIR/dflash/build/test_dflash}"
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
+LUCEBOX_SERVER_BACKEND="${LUCEBOX_SERVER_BACKEND:-python}"
+DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/dflash/build/dflash_server}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/workspace/llama-cpp-server-build/bin/llama-server}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
 LLAMA_FLASH_ATTN="${LLAMA_FLASH_ATTN:-1}"
@@ -61,6 +63,10 @@ start_lucebox_server() {
     echo "unknown MODEL_SERVER=$MODEL_SERVER; expected lucebox or llamacpp" >&2
     return 1
   fi
+  if [[ "$LUCEBOX_SERVER_BACKEND" == "cpp" ]]; then
+    start_dflash_native_server
+    return
+  fi
   cd "$REPO_DIR"
   local extra_args=()
   if [[ -n "$EXTRA_SERVER_ARGS" ]]; then
@@ -82,6 +88,43 @@ start_lucebox_server() {
     --cache-type-v "$CACHE_TYPE_V" \
     --prefix-cache-slots 0 \
     --prefill-cache-slots 0 \
+    "${extra_args[@]}" \
+    > "$SERVER_LOG" 2>&1 &
+  SERVER_PID=$!
+}
+
+start_dflash_native_server() {
+  if [[ ! -x "$DFLASH_SERVER_BIN" ]]; then
+    echo "dflash_server not found or not executable: $DFLASH_SERVER_BIN" >&2
+    echo "Build it first, for example:" >&2
+    echo "  cmake -S $REPO_DIR/dflash -B $REPO_DIR/dflash/build -DGGML_CUDA=ON" >&2
+    echo "  cmake --build $REPO_DIR/dflash/build --target dflash_server -j\$(nproc)" >&2
+    return 1
+  fi
+  local extra_args=()
+  if [[ -n "$EXTRA_SERVER_ARGS" ]]; then
+    read -r -a extra_args <<< "$EXTRA_SERVER_ARGS"
+  fi
+  local ddtree_args=()
+  if [[ "$VERIFY_MODE" == "ddtree" ]]; then
+    ddtree_args=(--ddtree --ddtree-budget "$BUDGET")
+  fi
+  local fa_args=()
+  if [[ -n "$FA_WINDOW" ]] && [[ "$FA_WINDOW" != "0" ]]; then
+    fa_args=(--fa-window "$FA_WINDOW")
+  fi
+  # Export KV cache type env vars for the C++ server to pick up.
+  export DFLASH27B_KV_K="$CACHE_TYPE_K"
+  export DFLASH27B_KV_V="$CACHE_TYPE_V"
+  "$DFLASH_SERVER_BIN" "$TARGET" \
+    --draft "$DRAFT" \
+    --host "$HOST" \
+    --port "$PORT" \
+    --max-ctx "$MAX_CTX" \
+    --max-tokens "$MAX_TOKENS" \
+    --model-name "$MODEL_ID" \
+    "${ddtree_args[@]}" \
+    "${fa_args[@]}" \
     "${extra_args[@]}" \
     > "$SERVER_LOG" 2>&1 &
   SERVER_PID=$!

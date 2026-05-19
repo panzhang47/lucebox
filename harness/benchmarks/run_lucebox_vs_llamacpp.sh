@@ -29,6 +29,9 @@ LLAMA_MODEL_ID="${LLAMA_MODEL_ID:-llama-cpp}"
 API_KEY="${API_KEY:-sk-lucebox}"
 PROMPTS="${PROMPTS:-$SCRIPT_DIR/prompts/generation_smoke.jsonl}"
 
+LUCEBOX_SERVER_BACKEND="${LUCEBOX_SERVER_BACKEND:-python}"
+DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/dflash/build/dflash_server}"
+
 mkdir -p "$LOG_DIR"
 
 wait_health() {
@@ -108,23 +111,55 @@ extra_args=()
 if [[ -n "$EXTRA_SERVER_ARGS" ]]; then
   read -r -a extra_args <<< "$EXTRA_SERVER_ARGS"
 fi
-python3 -u dflash/scripts/server.py \
-  --host "$HOST" \
-  --port "$LUCEBOX_PORT" \
-  --target "$TARGET" \
-  --draft "$DRAFT" \
-  --bin "$DFLASH_BIN" \
-  --budget "$BUDGET" \
-  --verify-mode "$VERIFY_MODE" \
-  --max-ctx "$MAX_CTX" \
-  --fa-window "$FA_WINDOW" \
-  --cache-type-k "$CACHE_TYPE_K" \
-  --cache-type-v "$CACHE_TYPE_V" \
-  --prefix-cache-slots 0 \
-  --prefill-cache-slots 0 \
-  "${extra_args[@]}" \
-  > "$LUCEBOX_LOG" 2>&1 &
-LUCEBOX_PID=$!
+if [[ "$LUCEBOX_SERVER_BACKEND" == "cpp" ]]; then
+  if [[ ! -x "$DFLASH_SERVER_BIN" ]]; then
+    echo "dflash_server not found or not executable: $DFLASH_SERVER_BIN" >&2
+    echo "Build it first, for example:" >&2
+    echo "  cmake -S $REPO_DIR/dflash -B $REPO_DIR/dflash/build -DGGML_CUDA=ON" >&2
+    echo "  cmake --build $REPO_DIR/dflash/build --target dflash_server -j\$(nproc)" >&2
+    exit 1
+  fi
+  local_ddtree_args=()
+  if [[ "$VERIFY_MODE" == "ddtree" ]]; then
+    local_ddtree_args=(--ddtree --ddtree-budget "$BUDGET")
+  fi
+  local_fa_args=()
+  if [[ -n "$FA_WINDOW" ]] && [[ "$FA_WINDOW" != "0" ]]; then
+    local_fa_args=(--fa-window "$FA_WINDOW")
+  fi
+  export DFLASH27B_KV_K="$CACHE_TYPE_K"
+  export DFLASH27B_KV_V="$CACHE_TYPE_V"
+  "$DFLASH_SERVER_BIN" "$TARGET" \
+    --draft "$DRAFT" \
+    --host "$HOST" \
+    --port "$LUCEBOX_PORT" \
+    --max-ctx "$MAX_CTX" \
+    --max-tokens "$MAX_TOKENS" \
+    --model-name "$MODEL_ID" \
+    "${local_ddtree_args[@]}" \
+    "${local_fa_args[@]}" \
+    "${extra_args[@]}" \
+    > "$LUCEBOX_LOG" 2>&1 &
+  LUCEBOX_PID=$!
+else
+  python3 -u dflash/scripts/server.py \
+    --host "$HOST" \
+    --port "$LUCEBOX_PORT" \
+    --target "$TARGET" \
+    --draft "$DRAFT" \
+    --bin "$DFLASH_BIN" \
+    --budget "$BUDGET" \
+    --verify-mode "$VERIFY_MODE" \
+    --max-ctx "$MAX_CTX" \
+    --fa-window "$FA_WINDOW" \
+    --cache-type-k "$CACHE_TYPE_K" \
+    --cache-type-v "$CACHE_TYPE_V" \
+    --prefix-cache-slots 0 \
+    --prefill-cache-slots 0 \
+    "${extra_args[@]}" \
+    > "$LUCEBOX_LOG" 2>&1 &
+  LUCEBOX_PID=$!
+fi
 wait_health "http://$HOST:$LUCEBOX_PORT/health" "$LUCEBOX_PID" "$LUCEBOX_LOG"
 
 python3 "$SCRIPT_DIR/generation_benchmark.py" run \

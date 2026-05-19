@@ -1,0 +1,566 @@
+// SSE emitter implementation — streaming state machine for all 3 API formats.
+
+#include "sse_emitter.h"
+#include "utf8_utils.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+
+namespace dflash27b {
+
+static const char THINK_OPEN[]  = "<think>";
+static const char THINK_CLOSE[] = "</think>";
+static const char TOOL_OPEN[]   = "<tool_call>";
+static constexpr size_t THINK_OPEN_LEN  = 7;
+static constexpr size_t THINK_CLOSE_LEN = 8;
+static constexpr size_t TOOL_OPEN_LEN   = 11;
+
+static std::string gen_item_id() {
+    static std::atomic<uint64_t> ctr{0};
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "item_%016llx", (unsigned long long)ctr.fetch_add(1));
+    return buf;
+}
+
+static int64_t unix_timestamp() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// ─── Constructor ────────────────────────────────────────────────────────
+
+SseEmitter::SseEmitter(ApiFormat format,
+                       const std::string & request_id,
+                       const std::string & model_name,
+                       int prompt_tokens,
+                       const json & tools,
+                       ToolMemory * tool_memory,
+                       bool started_in_thinking)
+    : format_(format)
+    , request_id_(request_id)
+    , model_name_(model_name)
+    , prompt_tokens_(prompt_tokens)
+    , tools_(tools)
+    , tool_memory_(tool_memory)
+    , mode_(started_in_thinking ? StreamMode::REASONING : StreamMode::CONTENT)
+    , active_kind_(started_in_thinking ? "thinking" : "text")
+    , created_at_(unix_timestamp())
+    , msg_item_id_(gen_item_id())
+{}
+
+// ─── SSE formatting helpers ─────────────────────────────────────────────
+
+std::string SseEmitter::sse_data(const std::string & json_str) {
+    return "data: " + json_str + "\n\n";
+}
+
+std::string SseEmitter::sse_event(const std::string & type, const std::string & json_str) {
+    return "event: " + type + "\ndata: " + json_str + "\n\n";
+}
+
+std::string SseEmitter::format_openai_delta(const json & delta, const char * finish) {
+    json chunk = {
+        {"id", request_id_},
+        {"object", "chat.completion.chunk"},
+        {"created", created_at_},
+        {"model", model_name_},
+        {"choices", json::array({{
+            {"index", 0},
+            {"delta", delta},
+            {"finish_reason", finish ? json(finish) : json(nullptr)}
+        }})}
+    };
+    return sse_data(chunk.dump());
+}
+
+std::string SseEmitter::format_anthropic_event(const std::string & event_type,
+                                                const json & data) {
+    json d = data;
+    d["type"] = event_type;
+    return sse_event(event_type, d.dump());
+}
+
+std::string SseEmitter::format_responses_event(const std::string & event_type,
+                                                const json & data) {
+    json d = data;
+    d["type"] = event_type;
+    return sse_event(event_type, d.dump());
+}
+
+// ─── emit_start ─────────────────────────────────────────────────────────
+
+std::vector<std::string> SseEmitter::emit_start() {
+    std::vector<std::string> out;
+
+    switch (format_) {
+    case ApiFormat::OPENAI_CHAT:
+        // Role delta
+        out.push_back(format_openai_delta({{"role", "assistant"}}));
+        break;
+
+    case ApiFormat::ANTHROPIC: {
+        // message_start
+        json msg_start = {
+            {"type", "message_start"},
+            {"message", {
+                {"id", request_id_}, {"type", "message"},
+                {"role", "assistant"}, {"model", model_name_},
+                {"content", json::array()},
+                {"stop_reason", nullptr}, {"stop_sequence", nullptr},
+                {"usage", {{"input_tokens", prompt_tokens_}, {"output_tokens", 0}}}
+            }}
+        };
+        out.push_back(sse_event("message_start", msg_start.dump()));
+
+        // First content block
+        json block;
+        if (active_kind_ == "thinking") {
+            block = {{"type", "thinking"}, {"thinking", ""}};
+        } else {
+            block = {{"type", "text"}, {"text", ""}};
+        }
+        json block_start = {
+            {"type", "content_block_start"},
+            {"index", block_index_},
+            {"content_block", block}
+        };
+        out.push_back(sse_event("content_block_start", block_start.dump()));
+        break;
+    }
+
+    case ApiFormat::RESPONSES: {
+        // response.created
+        json shell = {
+            {"id", request_id_}, {"object", "response"},
+            {"created_at", created_at_}, {"status", "in_progress"},
+            {"model", model_name_}
+        };
+        out.push_back(format_responses_event("response.created", {{"response", shell}}));
+
+        // output_item.added
+        out.push_back(format_responses_event("response.output_item.added", {
+            {"output_index", 0},
+            {"item", {{"type", "message"}, {"id", msg_item_id_},
+                      {"status", "in_progress"}, {"role", "assistant"},
+                      {"content", json::array()}}}
+        }));
+
+        // content_part.added
+        out.push_back(format_responses_event("response.content_part.added", {
+            {"item_id", msg_item_id_}, {"output_index", 0},
+            {"content_index", 0},
+            {"part", {{"type", "output_text"}, {"text", ""}, {"annotations", json::array()}}}
+        }));
+        break;
+    }
+
+    default:
+        break;
+    }
+
+    return out;
+}
+
+// ─── emit_token ─────────────────────────────────────────────────────────
+
+std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
+    // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
+    std::string piece = utf8_sanitize(raw_piece);
+    std::vector<std::string> out;
+    accumulated_raw_ += piece;
+    window_ += piece;
+
+    // State machine loop — processes the window
+    while (true) {
+        if (mode_ == StreamMode::TOOL_BUFFER) {
+            tool_buffer_ += window_;
+            window_.clear();
+            break;
+        }
+
+        if (mode_ == StreamMode::REASONING) {
+            // Strip leading <think> tag from reasoning (ds4 pattern).
+            // When started_in_thinking=true, the model may echo <think> again.
+            // The model may emit whitespace before <think>, so we skip leading
+            // whitespace first, then check for the tag.
+            if (!checked_think_prefix_) {
+                // Skip leading whitespace to find potential <think> tag
+                size_t ws = 0;
+                while (ws < window_.size() && (window_[ws] == '\n' || window_[ws] == ' ' || window_[ws] == '\r'))
+                    ws++;
+                if (ws + THINK_OPEN_LEN > window_.size()) break;  // wait for more
+                if (window_.compare(ws, THINK_OPEN_LEN, THINK_OPEN) == 0) {
+                    window_ = window_.substr(ws + THINK_OPEN_LEN);
+                }
+                checked_think_prefix_ = true;
+            }
+
+            size_t idx = window_.find(THINK_CLOSE);
+            if (idx != std::string::npos) {
+                std::string pre = window_.substr(0, idx);
+                if (!pre.empty()) {
+                    reasoning_text_ += pre;
+                    // Emit reasoning delta
+                    switch (format_) {
+                    case ApiFormat::OPENAI_CHAT:
+                        out.push_back(format_openai_delta({{"reasoning_content", pre}}));
+                        break;
+                    case ApiFormat::ANTHROPIC: {
+                        if (active_kind_ != "thinking") {
+                            out.push_back(sse_event("content_block_stop",
+                                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                            block_index_++;
+                            active_kind_ = "thinking";
+                            json new_block = {{"type", "thinking"}, {"thinking", ""}};
+                            out.push_back(sse_event("content_block_start",
+                                json({{"type", "content_block_start"}, {"index", block_index_},
+                                      {"content_block", new_block}}).dump()));
+                        }
+                        out.push_back(sse_event("content_block_delta",
+                            json({{"type", "content_block_delta"}, {"index", block_index_},
+                                  {"delta", {{"type", "thinking_delta"}, {"thinking", pre}}}}).dump()));
+                        break;
+                    }
+                    case ApiFormat::RESPONSES:
+                        // Responses API doesn't stream reasoning — it's stripped
+                        break;
+                    default: break;
+                    }
+                }
+                window_ = window_.substr(idx + THINK_CLOSE_LEN);
+                mode_ = StreamMode::CONTENT;
+                continue;
+            }
+            // No close tag yet — emit safe prefix if window is large enough
+            if (window_.size() > HOLDBACK) {
+                size_t cut = utf8_safe_len(window_, window_.size() - HOLDBACK);
+                if (cut == 0) break;  // not enough complete chars yet
+                std::string safe = window_.substr(0, cut);
+                reasoning_text_ += safe;
+                switch (format_) {
+                case ApiFormat::OPENAI_CHAT:
+                    out.push_back(format_openai_delta({{"reasoning_content", safe}}));
+                    break;
+                case ApiFormat::ANTHROPIC:
+                    if (active_kind_ != "thinking") {
+                        out.push_back(sse_event("content_block_stop",
+                            json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                        block_index_++;
+                        active_kind_ = "thinking";
+                        json new_block = {{"type", "thinking"}, {"thinking", ""}};
+                        out.push_back(sse_event("content_block_start",
+                            json({{"type", "content_block_start"}, {"index", block_index_},
+                                  {"content_block", new_block}}).dump()));
+                    }
+                    out.push_back(sse_event("content_block_delta",
+                        json({{"type", "content_block_delta"}, {"index", block_index_},
+                              {"delta", {{"type", "thinking_delta"}, {"thinking", safe}}}}).dump()));
+                    break;
+                case ApiFormat::RESPONSES:
+                    break;
+                default: break;
+                }
+                window_ = window_.substr(cut);
+            }
+            break;
+        }
+
+        // mode_ == StreamMode::CONTENT
+        // Look for <think>, </think>, or <tool_call>
+        size_t think_idx = window_.find(THINK_OPEN);
+        size_t think_close_idx = window_.find(THINK_CLOSE);
+        size_t tool_idx = window_.find(TOOL_OPEN);
+
+        struct Hit { size_t pos; int type; };  // type: 0=think, 1=think_close, 2=tool
+        std::vector<Hit> hits;
+        if (think_idx != std::string::npos)       hits.push_back({think_idx, 0});
+        if (think_close_idx != std::string::npos) hits.push_back({think_close_idx, 1});
+        if (tool_idx != std::string::npos)        hits.push_back({tool_idx, 2});
+
+        if (!hits.empty()) {
+            std::sort(hits.begin(), hits.end(),
+                      [](const Hit & a, const Hit & b) { return a.pos < b.pos; });
+            auto & h = hits[0];
+            std::string pre = window_.substr(0, h.pos);
+            if (!pre.empty()) {
+                accumulated_content_ += pre;
+                emit_content_delta(out, pre);
+            }
+
+            if (h.type == 0) {
+                // <think>
+                window_ = window_.substr(h.pos + THINK_OPEN_LEN);
+                mode_ = StreamMode::REASONING;
+            } else if (h.type == 1) {
+                // </think> in content — just skip it
+                window_ = window_.substr(h.pos + THINK_CLOSE_LEN);
+            } else {
+                // <tool_call>
+                tool_buffer_ = window_.substr(h.pos);
+                window_.clear();
+                mode_ = StreamMode::TOOL_BUFFER;
+            }
+            continue;
+        }
+
+        // No tags found — emit safe prefix
+        if (window_.size() > HOLDBACK) {
+            size_t cut = utf8_safe_len(window_, window_.size() - HOLDBACK);
+            if (cut > 0) {
+                std::string safe = window_.substr(0, cut);
+                accumulated_content_ += safe;
+                emit_content_delta(out, safe);
+                window_ = window_.substr(cut);
+            }
+        }
+        break;
+    }
+
+    return out;
+}
+
+// ─── Content delta emission (format-specific) ───────────────────────────
+
+void SseEmitter::emit_content_delta(std::vector<std::string> & out,
+                                    const std::string & text) {
+    if (text.empty()) return;
+
+    switch (format_) {
+    case ApiFormat::OPENAI_CHAT:
+        out.push_back(format_openai_delta({{"content", text}}));
+        break;
+
+    case ApiFormat::ANTHROPIC:
+        if (active_kind_ != "text") {
+            out.push_back(sse_event("content_block_stop",
+                json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+            block_index_++;
+            active_kind_ = "text";
+            json new_block = {{"type", "text"}, {"text", ""}};
+            out.push_back(sse_event("content_block_start",
+                json({{"type", "content_block_start"}, {"index", block_index_},
+                      {"content_block", new_block}}).dump()));
+        }
+        out.push_back(sse_event("content_block_delta",
+            json({{"type", "content_block_delta"}, {"index", block_index_},
+                  {"delta", {{"type", "text_delta"}, {"text", text}}}}).dump()));
+        break;
+
+    case ApiFormat::RESPONSES:
+        out.push_back(format_responses_event("response.output_text.delta", {
+            {"item_id", msg_item_id_}, {"output_index", 0},
+            {"content_index", 0}, {"delta", text}
+        }));
+        break;
+
+    default:
+        break;
+    }
+}
+
+// ─── emit_finish ────────────────────────────────────────────────────────
+
+std::vector<std::string> SseEmitter::emit_finish(int completion_tokens) {
+    std::vector<std::string> out;
+
+    // Flush remaining window
+    if (mode_ == StreamMode::REASONING && !window_.empty()) {
+        reasoning_text_ += window_;
+        switch (format_) {
+        case ApiFormat::OPENAI_CHAT:
+            out.push_back(format_openai_delta({{"reasoning_content", window_}}));
+            break;
+        case ApiFormat::ANTHROPIC:
+            out.push_back(sse_event("content_block_delta",
+                json({{"type", "content_block_delta"}, {"index", block_index_},
+                      {"delta", {{"type", "thinking_delta"}, {"thinking", window_}}}}).dump()));
+            break;
+        default: break;
+        }
+    } else if (mode_ == StreamMode::CONTENT && !window_.empty()) {
+        accumulated_content_ += window_;
+        emit_content_delta(out, window_);
+    } else if (mode_ == StreamMode::TOOL_BUFFER) {
+        tool_buffer_ += window_;
+    }
+    window_.clear();
+
+    // Parse tool calls from buffer
+    std::string fr = "stop";
+    if (mode_ == StreamMode::TOOL_BUFFER && !tool_buffer_.empty()) {
+        auto parsed = parse_tool_calls(tool_buffer_, tools_);
+        tool_calls_ = std::move(parsed.tool_calls);
+
+        if (!tool_calls_.empty()) {
+            // Remember for tool memory
+            if (tool_memory_) {
+                std::vector<std::string> ids;
+                for (const auto & tc : tool_calls_) ids.push_back(tc.id);
+                tool_memory_->remember(ids, accumulated_raw_);
+            }
+
+            // Emit any cleaned text from the tool buffer
+            if (!parsed.cleaned_text.empty()) {
+                accumulated_content_ += parsed.cleaned_text;
+                emit_content_delta(out, parsed.cleaned_text);
+            }
+
+            fr = "tool_calls";
+
+            // Format-specific tool call events
+            switch (format_) {
+            case ApiFormat::OPENAI_CHAT: {
+                json tc_list = json::array();
+                for (size_t i = 0; i < tool_calls_.size(); i++) {
+                    tc_list.push_back({
+                        {"index", (int)i},
+                        {"id", tool_calls_[i].id},
+                        {"type", "function"},
+                        {"function", {
+                            {"name", tool_calls_[i].name},
+                            {"arguments", tool_calls_[i].arguments}
+                        }}
+                    });
+                }
+                out.push_back(format_openai_delta({{"tool_calls", tc_list}}));
+                break;
+            }
+            case ApiFormat::ANTHROPIC:
+                // Anthropic doesn't have streaming tool calls in the same way
+                // Tool use blocks would be separate content blocks
+                break;
+            case ApiFormat::RESPONSES:
+                for (const auto & tc : tool_calls_) {
+                    out.push_back(format_responses_event(
+                        "response.function_call_arguments.delta", {
+                            {"item_id", tc.id}, {"output_index", 0},
+                            {"delta", tc.arguments}
+                        }));
+                    out.push_back(format_responses_event(
+                        "response.function_call_arguments.done", {
+                            {"item_id", tc.id}, {"output_index", 0},
+                            {"arguments", tc.arguments}, {"name", tc.name}
+                        }));
+                }
+                break;
+            default: break;
+            }
+        } else {
+            // No tool calls found — emit the buffer as content
+            accumulated_content_ += tool_buffer_;
+            emit_content_delta(out, tool_buffer_);
+        }
+    }
+
+    // Format-specific final events
+    switch (format_) {
+    case ApiFormat::OPENAI_CHAT: {
+        // Finish reason chunk
+        out.push_back(format_openai_delta(json::object(), fr.c_str()));
+        // Usage chunk
+        json usage = {
+            {"id", request_id_}, {"object", "chat.completion.chunk"},
+            {"created", created_at_}, {"model", model_name_},
+            {"choices", json::array()},
+            {"usage", {
+                {"prompt_tokens", prompt_tokens_},
+                {"completion_tokens", completion_tokens},
+                {"total_tokens", prompt_tokens_ + completion_tokens}
+            }}
+        };
+        out.push_back(sse_data(usage.dump()));
+        out.push_back(sse_data("[DONE]"));
+        break;
+    }
+
+    case ApiFormat::ANTHROPIC: {
+        // content_block_stop
+        out.push_back(sse_event("content_block_stop",
+            json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+        // message_delta
+        json msg_delta = {
+            {"type", "message_delta"},
+            {"delta", {{"stop_reason", "end_turn"}, {"stop_sequence", nullptr}}},
+            {"usage", {{"output_tokens", completion_tokens}}}
+        };
+        out.push_back(sse_event("message_delta", msg_delta.dump()));
+        // message_stop
+        out.push_back(sse_event("message_stop",
+            json({{"type", "message_stop"}}).dump()));
+        break;
+    }
+
+    case ApiFormat::RESPONSES: {
+        // output_text.done
+        out.push_back(format_responses_event("response.output_text.done", {
+            {"item_id", msg_item_id_}, {"output_index", 0},
+            {"content_index", 0}, {"text", accumulated_content_}
+        }));
+        // content_part.done
+        out.push_back(format_responses_event("response.content_part.done", {
+            {"item_id", msg_item_id_}, {"output_index", 0},
+            {"content_index", 0},
+            {"part", {{"type", "output_text"}, {"text", accumulated_content_},
+                      {"annotations", json::array()}}}
+        }));
+
+        // Build final output items
+        json final_output = json::array();
+        if (!tool_calls_.empty()) {
+            for (const auto & tc : tool_calls_) {
+                final_output.push_back({
+                    {"type", "function_call"}, {"id", tc.id},
+                    {"status", "completed"}, {"call_id", tc.id},
+                    {"name", tc.name}, {"arguments", tc.arguments}
+                });
+            }
+        } else {
+            final_output.push_back({
+                {"type", "message"}, {"id", msg_item_id_},
+                {"status", "completed"}, {"role", "assistant"},
+                {"content", json::array({{
+                    {"type", "output_text"}, {"text", accumulated_content_},
+                    {"annotations", json::array()}
+                }})}
+            });
+        }
+
+        // output_item.done for each item
+        for (size_t i = 0; i < final_output.size(); i++) {
+            out.push_back(format_responses_event("response.output_item.done", {
+                {"output_index", (int)i},
+                {"item", final_output[i]}
+            }));
+        }
+
+        // response.completed
+        json shell = {
+            {"id", request_id_}, {"object", "response"},
+            {"created_at", created_at_}, {"status", "completed"},
+            {"model", model_name_},
+            {"output", final_output},
+            {"output_text", accumulated_content_},
+            {"usage", {
+                {"input_tokens", prompt_tokens_},
+                {"output_tokens", completion_tokens},
+                {"total_tokens", prompt_tokens_ + completion_tokens}
+            }}
+        };
+        out.push_back(format_responses_event("response.completed", {{"response", shell}}));
+        break;
+    }
+
+    default:
+        out.push_back(sse_data("[DONE]"));
+        break;
+    }
+
+    return out;
+}
+
+std::string SseEmitter::finish_reason() const {
+    return tool_calls_.empty() ? "stop" : "tool_calls";
+}
+
+}  // namespace dflash27b

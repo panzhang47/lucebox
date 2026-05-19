@@ -26,6 +26,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <cstddef>
 
 namespace dflash27b {
 
@@ -110,6 +111,7 @@ private:
     // ── GPU backends ─────────────────────────────────────────────────
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;
+    ggml_backend_t snap_backend_   = nullptr;  // snapshot storage (CPU or unified)
     bool           split_gpus_     = false;
 
     // ── Model weights + caches ───────────────────────────────────────
@@ -126,7 +128,7 @@ private:
     DraftFeatureMirror feature_mirror_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────
-    static constexpr int PREFIX_SLOTS = 8;
+    static constexpr int PREFIX_SLOTS = 64;
     PrefixSnapshot prefix_snapshots_[PREFIX_SLOTS];
 
     // ── Park state ───────────────────────────────────────────────────
@@ -140,6 +142,11 @@ private:
     // ── Sampler state ────────────────────────────────────────────────
     SamplerCfg      sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};
+
+    // Last prefill chunk metadata, used to sample the first generated token
+    // without deriving a chunk-local offset from absolute KV position.
+    std::size_t     prefill_last_logits_offset_ = 0;
+    bool            prefill_last_logits_valid_  = false;
 
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;

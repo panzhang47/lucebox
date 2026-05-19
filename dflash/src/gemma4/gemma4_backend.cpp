@@ -10,6 +10,7 @@
 #include "common/io_utils.h"
 
 #include "ggml-cuda.h"
+#include "common/snapshot_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -29,6 +30,13 @@ bool Gemma4Backend::init() {
     backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!backend_) {
         std::fprintf(stderr, "[gemma4] CUDA backend init failed (gpu=%d)\n", cfg_.device.gpu);
+        return false;
+    }
+
+    snap_backend_ = create_snapshot_backend(backend_);
+    if (!snap_backend_) {
+        std::fprintf(stderr, "[gemma4] snapshot backend init failed\n");
+        ggml_backend_free(backend_); backend_ = nullptr;
         return false;
     }
 
@@ -245,11 +253,12 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
     }
 
     const auto & snap = snapshots_[slot];
-    // Only copy layers that have real KV
+    // Copy right-sized snapshot into full-size cache (position is outermost dim).
     for (int il = 0; il < cache_.n_layer; ++il) {
         if (cache_.k[il] && snap.k_snap[il]) {
-            ggml_backend_tensor_copy(snap.k_snap[il], cache_.k[il]);
-            ggml_backend_tensor_copy(snap.v_snap[il], cache_.v[il]);
+            const size_t nbytes = ggml_nbytes(snap.k_snap[il]);
+            ggml_backend_tensor_set(cache_.k[il], snap.k_snap[il]->data, 0, nbytes);
+            ggml_backend_tensor_set(cache_.v[il], snap.v_snap[il]->data, 0, nbytes);
         }
     }
     cache_.cur_pos = snap.cur_pos;
@@ -261,39 +270,53 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
 
 bool Gemma4Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    snapshot_free(slot);
 
     auto & snap = snapshots_[slot];
     const int n_layer = cache_.n_layer;
+    const int snap_pos = cache_.cur_pos;
+    if (snap_pos <= 0) return false;
 
-    ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * (size_t)(n_layer * 2 + 4) + 4096;
-    ip.no_alloc = true;
-    snap.ctx = ggml_init(ip);
-    if (!snap.ctx) return false;
+    // Reuse buffer if shapes match (same cur_pos); otherwise reallocate.
+    const bool needs_alloc = (snap.ctx == nullptr) || (snap.cur_pos != snap_pos);
+    if (needs_alloc) {
+        free_gemma4_snapshot(snap);
 
-    snap.k_snap.resize(n_layer, nullptr);
-    snap.v_snap.resize(n_layer, nullptr);
-    for (int il = 0; il < n_layer; ++il) {
-        if (cache_.k[il]) {
-            snap.k_snap[il] = ggml_dup_tensor(snap.ctx, cache_.k[il]);
-            snap.v_snap[il] = ggml_dup_tensor(snap.ctx, cache_.v[il]);
+        ggml_init_params ip{};
+        ip.mem_size = ggml_tensor_overhead() * (size_t)(n_layer * 2 + 4) + 4096;
+        ip.no_alloc = true;
+        snap.ctx = ggml_init(ip);
+        if (!snap.ctx) return false;
+
+        snap.k_snap.resize(n_layer, nullptr);
+        snap.v_snap.resize(n_layer, nullptr);
+        for (int il = 0; il < n_layer; ++il) {
+            if (cache_.k[il]) {
+                // Right-sized: [D, Hk, snap_pos] instead of [D, Hk, max_ctx]
+                ggml_tensor * ck = cache_.k[il];
+                snap.k_snap[il] = ggml_new_tensor_3d(snap.ctx, ck->type,
+                                                      ck->ne[0], ck->ne[1], snap_pos);
+                snap.v_snap[il] = ggml_new_tensor_3d(snap.ctx, ck->type,
+                                                      ck->ne[0], ck->ne[1], snap_pos);
+            }
+        }
+
+        snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, snap_backend_);
+        if (!snap.buf) {
+            ggml_free(snap.ctx); snap.ctx = nullptr;
+            snap.k_snap.clear(); snap.v_snap.clear();
+            return false;
         }
     }
 
-    snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend_);
-    if (!snap.buf) {
-        ggml_free(snap.ctx); snap.ctx = nullptr;
-        return false;
-    }
-
+    // Copy first snap_pos positions (contiguous — position is outermost dim).
     for (int il = 0; il < n_layer; ++il) {
-        if (cache_.k[il]) {
-            ggml_backend_tensor_copy(cache_.k[il], snap.k_snap[il]);
-            ggml_backend_tensor_copy(cache_.v[il], snap.v_snap[il]);
+        if (cache_.k[il] && snap.k_snap[il]) {
+            const size_t nbytes = ggml_nbytes(snap.k_snap[il]);
+            ggml_backend_tensor_get(cache_.k[il], snap.k_snap[il]->data, 0, nbytes);
+            ggml_backend_tensor_get(cache_.v[il], snap.v_snap[il]->data, 0, nbytes);
         }
     }
-    snap.cur_pos = cache_.cur_pos;
+    snap.cur_pos = snap_pos;
 
     std::printf("[gemma4] snapshot saved slot=%d pos=%d\n", slot, snap.cur_pos);
     std::fflush(stdout);
@@ -341,6 +364,8 @@ void Gemma4Backend::shutdown() {
     for (int i = 0; i < PREFIX_SLOTS; ++i) snapshot_free(i);
     free_gemma4_cache(cache_);
     free_gemma4_weights(w_);
+    free_snapshot_backend(snap_backend_, backend_);
+    snap_backend_ = nullptr;
     if (backend_) { ggml_backend_free(backend_); backend_ = nullptr; }
     std::printf("[gemma4] shutdown\n"); std::fflush(stdout);
 }

@@ -15,6 +15,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ── nlohmann/json (header-only, prefer system install, fallback to download) ──
+find_package(nlohmann_json CONFIG QUIET)
+if(NOT nlohmann_json_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(json
+        URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+        URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+    )
+    FetchContent_MakeAvailable(json)
+endif()
+
 # If we do not set this, ggml will output to bin and DLLs will not load
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 # ROCm root for HIP builds (rpath + rocwmma header discovery).
@@ -195,6 +206,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
 
 add_library(dflash27b STATIC
@@ -239,9 +251,18 @@ add_library(dflash27b STATIC
     src/common/sampler.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
+    src/common/backend_factory.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
     src/common/peer_access.cpp
+    # ── Server components (tokenizer, chat template) ──
+    src/server/tokenizer.cpp
+    src/server/chat_template.cpp
+    src/server/tool_parser.cpp
+    src/server/reasoning.cpp
+    src/server/tool_memory.cpp
+    src/server/sse_emitter.cpp
+    src/server/prefix_cache.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
@@ -453,6 +474,7 @@ target_link_libraries(dflash27b
         ggml
         ${DFLASH27B_GGML_BACKEND_TARGET}
         ggml-base
+        nlohmann_json::nlohmann_json
 )
 if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     target_link_libraries(dflash27b PRIVATE hip::host)
@@ -594,6 +616,79 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_dflash PRIVATE OpenMP::OpenMP_CXX)
         endif()
     endif()
+
+    # ─── dflash_server: native C++ HTTP server ─────────────────────────
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/server/server_main.cpp")
+        add_executable(dflash_server
+            src/server/server_main.cpp
+            src/server/http_server.cpp
+        )
+        target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(dflash_server PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash27b_cuda_min_sm})
+        endif()
+        target_link_libraries(dflash_server PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(dflash_server PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(dflash_server PRIVATE hip::host)
+        endif()
+    endif()
+
+    # Tokenizer test harness (no GPU needed — links static lib for tokenizer + GGUF reader)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_tokenizer_harness.cpp")
+        add_executable(test_tokenizer_harness test/test_tokenizer_harness.cpp)
+        target_include_directories(test_tokenizer_harness PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_tokenizer_harness PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_tokenizer_harness PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash27b_cuda_min_sm})
+        endif()
+        target_link_libraries(test_tokenizer_harness PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_tokenizer_harness PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_tokenizer_harness PRIVATE hip::host)
+        endif()
+    endif()
+
+    # ─── Unit tests (no GPU, no model files) ────────────────────────────
+    enable_testing()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
+        add_executable(test_server_unit test/test_server_unit.cpp)
+        target_include_directories(test_server_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_server_unit PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_server_unit PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash27b_cuda_min_sm})
+        endif()
+        target_link_libraries(test_server_unit PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_server_unit PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_server_unit PRIVATE hip::host)
+        endif()
+        add_test(NAME server_unit COMMAND test_server_unit)
+    endif()
+
+    # 'make check' — builds test targets then runs ctest
+    add_custom_target(check
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+        DEPENDS test_server_unit
+        COMMENT "Building and running unit tests"
+    )
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     # internal.h includes <cuda_runtime.h> when GGML_USE_CUDA is set; link

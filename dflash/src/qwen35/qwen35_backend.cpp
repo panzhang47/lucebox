@@ -12,6 +12,7 @@
 #include "qwen3/qwen3_drafter.h"
 
 #include "ggml-cuda.h"
+#include "common/snapshot_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -51,6 +52,14 @@ bool Qwen35Backend::init() {
     }
     if (split_gpus_ && g_peer_access_opt_in) {
         enable_peer_access_pair(cfg_.device.gpu, cfg_.draft_gpu);
+    }
+
+    // Snapshot backend: on discrete GPU uses system RAM; on unified memory
+    // (Metal, iGPU) stays on compute backend.
+    snap_backend_ = create_snapshot_backend(target_backend_);
+    if (!snap_backend_) {
+        std::fprintf(stderr, "snapshot backend init failed\n");
+        return false;
     }
 
     // Load target
@@ -171,9 +180,8 @@ bool Qwen35Backend::unpark(const std::string & what) {
 
 bool Qwen35Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    snapshot_free(slot);
     PrefixSnapshot & snap = prefix_snapshots_[slot];
-    return snapshot_target_cache(w_, cache_, target_backend_, snap);
+    return snapshot_target_cache(w_, cache_, snap_backend_, snap);
 }
 
 void Qwen35Backend::snapshot_free(int slot) {
@@ -194,14 +202,9 @@ int Qwen35Backend::snapshot_cur_pos(int slot) const {
 // ── Compress (pflash) ───────────────────────────────────────────────────
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
-    // Check for "nopark" as the last space-delimited token (not substring)
-    // to avoid false matches against file paths containing that text.
-    bool skip_park = false;
-    {
-        auto pos = line.rfind(' ');
-        if (pos != std::string::npos && line.substr(pos + 1) == "nopark")
-            skip_park = true;
-    }
+    // Check for "nopark" suffix (must be a separate token, not part of a path)
+    bool skip_park = (line.size() >= 16 &&
+                      line.compare(line.size() - 7, 7, " nopark") == 0);
 
     // Parse: "compress <path> <keep_x1000> <drafter_gguf> [nopark]"
     char ppath[1024];
@@ -301,7 +304,7 @@ bool Qwen35Backend::try_handle_command(const std::string & line, const DaemonIO 
         if (slot >= 0 && slot < PREFIX_SLOTS) {
             snapshot_free(slot);
             PrefixSnapshot & snap = prefix_snapshots_[slot];
-            snapshot_target_cache_thin(w_, cache_, target_backend_,
+            snapshot_target_cache_thin(w_, cache_, snap_backend_,
                                        /*kv_start=*/0, /*kv_end=*/cache_.cur_pos, snap);
             std::printf("[snapshot_thin] slot=%d pos=%d\n", slot, snap.cur_pos);
             std::fflush(stdout);
@@ -345,6 +348,10 @@ void Qwen35Backend::shutdown() {
     if (target_backend_) {
         ggml_backend_free(target_backend_);
         target_backend_ = nullptr;
+    }
+    if (snap_backend_) {
+        free_snapshot_backend(snap_backend_, target_backend_);
+        snap_backend_ = nullptr;
     }
 }
 
@@ -463,11 +470,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     (void)io;
 
     const int hidden = w_.n_embd;
+    const int vocab  = w_.n_vocab;
     int prefill_ubatch = 512;
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         prefill_ubatch = std::max(1, std::atoi(s));
     }
     const int prompt_len = (int)tokens.size();
+    prefill_last_logits_valid_ = false;
 
     // Skip KV-cache migration when resuming from a snapshot — the cache was
     // already migrated when the snapshot was taken; re-running migrate would
@@ -501,11 +510,15 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
 
+        // Prefill always uses full attention (fa_window=0) so that all
+        // positions encode the complete context — critical for tool
+        // definitions at prompt start to propagate into KV values that
+        // decode-time windowed attention will later read.
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
                                with_mask, /*capture=*/true,
                                /*capture_delta_intermediate=*/false,
-                               cfg_.fa_window,
+                               /*fa_window=*/0,
                                /*last_token_logits_only=*/(start + n_tokens < prompt_len),
                                cfg_.kq_stride_pad)) {
             std::fprintf(stderr, "prefill build @%d\n", kv_pos);
@@ -531,13 +544,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         ggml_backend_tensor_set(sg_.positions, pos_buf.data(), 0,
                                 sizeof(int32_t) * pos_buf.size());
 
-        // Mask
+        // Mask — full attention during prefill (no windowing)
         if (sg_.attn_mask) {
-            const int win_start = (cfg_.fa_window > 0 && kv_pos > cfg_.fa_window)
-                                      ? (kv_pos - cfg_.fa_window) : 0;
+            const int win_start = 0;
             const int kv_len = kv_pos + n_tokens - win_start;
             std::vector<uint16_t> mask_buf;
-            build_causal_mask(mask_buf, kv_len, n_tokens, kv_pos, cfg_.kq_stride_pad, win_start);
+            const int kv_pad_override = (int)sg_.attn_mask->ne[0];
+            build_causal_mask(mask_buf, kv_len, n_tokens, kv_pos, cfg_.kq_stride_pad, win_start, kv_pad_override);
             ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
         }
@@ -550,10 +563,15 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         int32_t last_tok = -1;
+        const bool is_final_chunk = (start + n_tokens >= prompt_len);
         const size_t argmax_off =
-            (start + n_tokens < prompt_len) ? 0 : sizeof(int32_t) * (size_t)(n_tokens - 1);
+            is_final_chunk ? sizeof(int32_t) * (size_t)(n_tokens - 1) : 0;
         ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, argmax_off, sizeof(int32_t));
         cache_.last_tok = last_tok;
+        if (is_final_chunk) {
+            prefill_last_logits_offset_ = (size_t)(n_tokens - 1) * (size_t)vocab * sizeof(float);
+            prefill_last_logits_valid_ = true;
+        }
 
         committed = kv_pos + n_tokens;
         cache_.cur_pos = committed;
@@ -579,18 +597,40 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     return committed;
 }
 
-// ── AR decode fallback (no draft model) ─────────────────────────────────
-
 bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io) {
+    if (n_gen <= 0) return true;
+
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     std::vector<float> logits_buf(vocab);
     std::vector<float> embed_buf_vec(hidden);
     float * embed_buf = embed_buf_vec.data();
 
-    for (int i = 0; i < n_gen; i++) {
+    // First token: consume the final prefill position.  Do not derive this
+    // offset from committed/KV position: restore paths can prefill a delta at
+    // nonzero KV offsets, and committed then no longer describes chunk size.
+    {
+        int32_t first_tok;
+        if (sampler_.temp > 0) {
+            if (!prefill_last_logits_valid_) return false;
+            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), prefill_last_logits_offset_,
+                                    sizeof(float) * vocab);
+            first_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                      out_tokens, sampler_rng_);
+        } else {
+            first_tok = cache_.last_tok;
+        }
+        out_tokens.push_back(first_tok);
+        io.emit(first_tok);
+        if (IS_EOS_TOK(first_tok, w_)) return true;
+        committed++;
+        cache_.cur_pos = committed;
+    }
+
+    // AR decode loop for remaining tokens
+    for (int i = 1; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
@@ -643,12 +683,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     const DaemonIO & io) {
     const int hidden = w_.n_embd;
 
-    // First token = prefill's last-position argmax. do_prefill already read it
-    // into cache_.last_tok using the correct per-chunk offset. Re-reading
-    // sg_.argmax_tokens here with a hardcoded ubatch indexed it by
-    // `committed % 512`, which overruns the decode-step argmax tensor for any
-    // prompt longer than that tensor (issue #191: ggml "tensor read out of
-    // bounds" -> daemon abort on the first real-sized request).
+    // First token: use the argmax that do_prefill already sampled and stored.
+    // Reading sg_.argmax_tokens with a computed offset is fragile: when
+    // restore_and_generate calls do_prefill with kv_offset != 0, committed
+    // reflects total KV position but the last chunk size was
+    // delta.size() % ubatch, making (committed % 512) wrong and causing an
+    // out-of-bounds tensor read.  cache_.last_tok is always correct.
     int32_t last_tok = cache_.last_tok;
 
     // Check if we can use speculative decode:
@@ -661,13 +701,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         && sampler_.temp == 0.0f;
 
     if (!can_spec) {
-        // AR fallback: emit first token, then loop.
-        out_tokens.push_back(last_tok);
-        io.emit(last_tok);
-        committed++;
-        cache_.cur_pos = committed;
-        if (io.cancelled || IS_EOS_TOK(last_tok, w_)) { io.emit(-1); return true; }
-        bool ok = do_ar_decode(committed, n_gen - 1, out_tokens, io);
+        // AR fallback consumes the final prefill position itself, then advances
+        // one token at a time.
+        bool ok = do_ar_decode(committed, n_gen, out_tokens, io);
         io.emit(-1);
         return ok;
     }
@@ -718,7 +754,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
                               draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
-                              committed)) {
+                              committed,
+                              /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
             std::fprintf(stderr, "spec-decode: draft build failed\n");
             step_graph_destroy(draft_sg);
             return false;

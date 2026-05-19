@@ -90,7 +90,9 @@ struct ModelBackend {
                                      const DaemonIO & io) = 0;
 
     // ── Snapshots ────────────────────────────────────────────────────
-    static constexpr int kMaxSlots = 8;
+    // With right-sized CPU-resident snapshots, each slot costs only
+    // ~(cur_pos × 5 KB) of system RAM, so we can afford many slots.
+    static constexpr int kMaxSlots = 64;
 
     virtual bool snapshot_save(int slot) = 0;
     virtual void snapshot_free(int slot) = 0;

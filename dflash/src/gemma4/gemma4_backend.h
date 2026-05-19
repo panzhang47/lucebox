@@ -67,6 +67,7 @@ public:
 private:
     Gemma4BackendConfig   cfg_;
     ggml_backend_t        backend_ = nullptr;
+    ggml_backend_t        snap_backend_ = nullptr;
     Gemma4Weights         w_;
     Gemma4Cache           cache_;
     bool                  parked_ = false;
@@ -76,7 +77,7 @@ private:
     std::mt19937_64       sampler_rng_{std::random_device{}()};
 
     // Snapshots
-    static constexpr int PREFIX_SLOTS = 8;
+    static constexpr int PREFIX_SLOTS = 64;
     Gemma4Snapshot        snapshots_[PREFIX_SLOTS];
 
     // Prefill prompt tokens in chunks, return committed position.

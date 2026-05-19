@@ -7,15 +7,16 @@
 
 namespace dflash27b {
 
-bool build_draft_step(
+// Build draft graph at a given ctx_len into sg. Does NOT touch sg.alloc.
+// mirror_view: if true, uses a view into mirror->target_feat at slot0.
+static bool build_draft_graph_internal(
     StepGraph & sg,
     const DraftWeights & dw,
     ggml_tensor * lm_head,
-    ggml_backend_t backend,
     int ctx_len,
     const DraftFeatureMirror * mirror,
-    int committed) {
-    step_graph_free(sg);
+    int mirror_slot0,
+    bool mirror_view) {
 
     ggml_init_params ip{};
     ip.mem_size   = 256 * 1024 * 1024;
@@ -32,8 +33,7 @@ bool build_draft_step(
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
 
-    int mirror_slot0 = 0;
-    if (mirror && draft_feature_mirror_can_view(*mirror, committed, ctx_len, mirror_slot0)) {
+    if (mirror_view) {
         const size_t stride = mirror->target_feat->nb[1];
         sg.target_hidden_cat = ggml_view_3d(
             sg.ctx,
@@ -81,10 +81,50 @@ bool build_draft_step(
         ggml_set_output(sg.hidden_states);
         ggml_build_forward_expand(sg.gf, sg.hidden_states);
     }
+    return true;
+}
+
+bool build_draft_step(
+    StepGraph & sg,
+    const DraftWeights & dw,
+    ggml_tensor * lm_head,
+    ggml_backend_t backend,
+    int ctx_len,
+    const DraftFeatureMirror * mirror,
+    int committed,
+    int /*ctx_len_max*/) {
+    step_graph_free(sg);
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
+
+    int mirror_slot0 = 0;
+    const bool use_view = mirror &&
+        draft_feature_mirror_can_view(*mirror, committed, ctx_len, mirror_slot0);
+
+    // If ctx_len exceeds our cached reserve, re-reserve at next 64 boundary.
+    // This makes all subsequent alloc_graph calls within the 64-token window
+    // a no-op (no CUDA free+alloc).
+    const int ctx_padded = (ctx_len + 63) & ~63;
+    if (ctx_padded > sg.alloc_reserved_ctx) {
+        // Build a dummy graph at ctx_padded just for sizing.
+        // Use non-view path for reserve (view tensors don't need allocation).
+        if (!build_draft_graph_internal(sg, dw, lm_head, ctx_padded,
+                                        nullptr, 0, false)) {
+            return false;
+        }
+        ggml_gallocr_reserve(sg.alloc, sg.gf);
+        sg.alloc_reserved_ctx = ctx_padded;
+        step_graph_free(sg);
+    }
+
+    // Build real graph at ctx_len for actual computation.
+    if (!build_draft_graph_internal(sg, dw, lm_head, ctx_len,
+                                    mirror, mirror_slot0, use_view)) {
+        return false;
+    }
+
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 

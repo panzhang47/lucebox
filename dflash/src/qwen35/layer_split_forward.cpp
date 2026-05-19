@@ -164,7 +164,8 @@ bool run_target_layer_split_forward(
                 const int win_start_l = (fa_window > 0 && kv_start > fa_window)
                                             ? (kv_start - fa_window) : 0;
                 const int win_len_l = kv_len - win_start_l;
-                build_causal_mask(mask_buf, win_len_l, n, kv_start, kq_stride_pad, win_start_l);
+                const int kv_pad_override = (int)shard->layer_graph.attn_mask->ne[0];
+                build_causal_mask(mask_buf, win_len_l, n, kv_start, kq_stride_pad, win_start_l, kv_pad_override);
                 ggml_backend_tensor_set(shard->layer_graph.attn_mask, mask_buf.data(), 0,
                                         sizeof(uint16_t) * mask_buf.size());
             }

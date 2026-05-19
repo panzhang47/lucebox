@@ -21,6 +21,10 @@ struct StepGraph {
     ggml_cgraph *   gf  = nullptr;
     ggml_gallocr_t  alloc = nullptr;
 
+    // The ctx_len last used for ggml_gallocr_reserve (draft only).
+    // When the real ctx_len fits within this, alloc_graph is a no-op.
+    int alloc_reserved_ctx = 0;
+
     // Named inputs
     ggml_tensor *   inp_embed = nullptr;
     ggml_tensor *   positions = nullptr;

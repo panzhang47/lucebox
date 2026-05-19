@@ -821,7 +821,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     bus = DaemonStdoutBus(daemon_proc.stdout, verbose=verbose_daemon)
 
     def _resolve_kv_k_type():
-        kv = "q8_0"
+        kv = "q4_0"
         if os.environ.get("DFLASH27B_KV_F16", "0") != "0":
             kv = "f16"
         if os.environ.get("DFLASH27B_KV_Q4", "0") != "0":
