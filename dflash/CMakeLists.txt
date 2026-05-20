@@ -273,6 +273,9 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     set_target_properties(dflash27b PROPERTIES HIP_ARCHITECTURES "${_dflash27b_archs}")
     target_compile_definitions(dflash27b PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+    # hip_compat shim is needed by ALL dflash27b sources (peer_access.cpp,
+    # dflash_feature_ring.cpp, flashprefill.cpp), not just the SM80_EQUIV path.
+    target_include_directories(dflash27b PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
 endif()
 
 # FlashPrefill custom kernels.
