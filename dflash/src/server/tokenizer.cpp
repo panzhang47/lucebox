@@ -364,34 +364,76 @@ static std::string encode_gpt2_bpe(const std::string & text) {
 std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) const {
     if (piece.empty()) return {};
 
-    // Convert raw text to GPT-2 byte encoding for vocab lookup.
-    // The GGUF vocab stores tokens in GPT-2's byte-to-unicode encoding,
-    // so " world" becomes "Ġworld" (space 0x20 → Ġ U+0120).
-    std::string encoded = encode_gpt2_bpe(piece);
-
-    // Start with individual bytes/chars as initial symbols.
-    // Each symbol is a string that we look up in the vocab.
     std::vector<std::string> symbols;
 
-    // Try to find the encoded piece as a single token first.
-    auto it = token_to_id_.find(encoded);
-    if (it != token_to_id_.end()) {
-        return { it->second };
-    }
+    if (is_sentencepiece_) {
+        // SentencePiece: replace leading space with ▁, tokens are raw UTF-8.
+        std::string sp_piece;
+        sp_piece.reserve(piece.size() + 2);
+        size_t start = 0;
+        if (!piece.empty() && piece[0] == ' ') {
+            sp_piece += "\xe2\x96\x81";  // ▁ (U+2581)
+            start = 1;
+        }
+        sp_piece += piece.substr(start);
+        // Replace any remaining spaces with ▁
+        std::string encoded;
+        encoded.reserve(sp_piece.size());
+        for (char c : sp_piece) {
+            if (c == ' ') {
+                encoded += "\xe2\x96\x81";
+            } else {
+                encoded += c;
+            }
+        }
 
-    // Split into individual GPT-2-encoded bytes as initial BPE symbols.
-    // Each raw byte becomes a single GPT-2 Unicode character (possibly multi-byte UTF-8).
-    for (size_t i = 0; i < piece.size(); i++) {
-        std::string sym = byte_to_gpt2_unicode((uint8_t)piece[i]);
-        auto sit = token_to_id_.find(sym);
-        if (sit != token_to_id_.end()) {
-            symbols.push_back(sym);
-        } else {
-            // Byte-fallback: use <0xNN> tokens
-            char buf[8];
-            std::snprintf(buf, sizeof(buf), "<0x%02X>",
-                          (unsigned)(uint8_t)piece[i]);
-            symbols.push_back(buf);
+        // Try whole piece as single token.
+        auto it = token_to_id_.find(encoded);
+        if (it != token_to_id_.end()) {
+            return { it->second };
+        }
+
+        // Split into individual UTF-8 characters as initial BPE symbols.
+        const char * p = encoded.c_str();
+        const char * end = p + encoded.size();
+        while (p < end) {
+            int cplen;
+            utf8_decode(p, (size_t)(end - p), &cplen);
+            if (cplen <= 0) cplen = 1;
+            std::string sym(p, cplen);
+            auto sit = token_to_id_.find(sym);
+            if (sit != token_to_id_.end()) {
+                symbols.push_back(sym);
+            } else {
+                // Byte-fallback: <0xNN>
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "<0x%02X>", (unsigned)(uint8_t)*p);
+                symbols.push_back(buf);
+            }
+            p += cplen;
+        }
+    } else {
+        // GPT-2 BPE: convert raw text to GPT-2 byte encoding for vocab lookup.
+        std::string encoded = encode_gpt2_bpe(piece);
+
+        // Try to find the encoded piece as a single token first.
+        auto it = token_to_id_.find(encoded);
+        if (it != token_to_id_.end()) {
+            return { it->second };
+        }
+
+        // Split into individual GPT-2-encoded bytes as initial BPE symbols.
+        for (size_t i = 0; i < piece.size(); i++) {
+            std::string sym = byte_to_gpt2_unicode((uint8_t)piece[i]);
+            auto sit = token_to_id_.find(sym);
+            if (sit != token_to_id_.end()) {
+                symbols.push_back(sym);
+            } else {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "<0x%02X>",
+                              (unsigned)(uint8_t)piece[i]);
+                symbols.push_back(buf);
+            }
         }
     }
 
@@ -538,6 +580,18 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
                      added_tokens_.size());
     }
 
+    // Detect tokenizer model type (sentencepiece vs bpe).
+    int model_key = gguf_find_key(gctx, "tokenizer.ggml.model");
+    if (model_key >= 0) {
+        const char * model = gguf_get_val_str(gctx, model_key);
+        // SentencePiece models store tokens as raw UTF-8 with ▁ for space.
+        // GPT-2/BPE models use byte-level Unicode encoding.
+        if (model && (std::strcmp(model, "llama") == 0 ||
+                      std::strncmp(model, "gemma", 5) == 0)) {
+            is_sentencepiece_ = true;
+        }
+    }
+
     // Detect pre-tokenizer type.
     int pre_key = gguf_find_key(gctx, "tokenizer.ggml.pre");
     if (pre_key >= 0) {
@@ -564,12 +618,18 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
         auto eot = token_to_id_.find("<|im_end|>");
         if (eot != token_to_id_.end()) eos_chat_id_ = eot->second;
     }
+    if (eos_chat_id_ < 0) {
+        // Gemma4 uses <turn|> as end-of-turn.
+        auto eot = token_to_id_.find("<turn|>");
+        if (eot != token_to_id_.end()) eos_chat_id_ = eot->second;
+    }
 
     gguf_free(gctx);
 
-    std::fprintf(stderr, "[tokenizer] loaded vocab=%d merges=%zu bos=%d eos=%d eot=%d pre=%s\n",
+    std::fprintf(stderr, "[tokenizer] loaded vocab=%d merges=%zu bos=%d eos=%d eot=%d pre=%s sp=%s\n",
                  n_vocab, merge_rank_.size(), bos_id_, eos_id_, eos_chat_id_,
-                 pre_type_ == PreTokenizer::QWEN35 ? "qwen35" : "qwen2");
+                 pre_type_ == PreTokenizer::QWEN35 ? "qwen35" : "qwen2",
+                 is_sentencepiece_ ? "yes" : "no");
     return true;
 }
 
@@ -686,9 +746,31 @@ std::string Tokenizer::token_text(int32_t id) const {
         }
     }
 
-    // Special tokens (e.g. <|im_start|>) — return as-is.
+    // Special tokens (e.g. <|im_start|>, <turn|>) — return as-is.
     if (!tok.empty() && tok[0] == '<' && tok.back() == '>') {
         return tok;
+    }
+
+    if (is_sentencepiece_) {
+        // SentencePiece: tokens are raw UTF-8 with ▁ (U+2581) for space.
+        std::string out;
+        out.reserve(tok.size());
+        const char * p = tok.c_str();
+        const char * end = p + tok.size();
+        while (p < end) {
+            // ▁ is 3 bytes: 0xE2 0x96 0x81
+            if (end - p >= 3 &&
+                (uint8_t)p[0] == 0xE2 &&
+                (uint8_t)p[1] == 0x96 &&
+                (uint8_t)p[2] == 0x81) {
+                out.push_back(' ');
+                p += 3;
+            } else {
+                out.push_back(*p);
+                p++;
+            }
+        }
+        return out;
     }
 
     // Decode GPT-2 byte-level BPE encoding → raw bytes.

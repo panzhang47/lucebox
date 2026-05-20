@@ -443,7 +443,6 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                                                     true, enable_thinking,
                                                     tools_json);
         req.prompt_tokens = tokenizer_.encode(rendered);
-
         // Detect if prompt ends with <think> (model will start in reasoning mode).
         if (enable_thinking) {
             size_t end = rendered.size();
@@ -691,11 +690,35 @@ void HttpServer::worker_loop() {
 
             // Skip EOS/EOT/special tokens — don't forward to SSE.
             int32_t eos = tokenizer_.eos_id();
-            if (token == eos) return true;
-            // Also skip common Qwen3 special tokens by checking if the raw
-            // token text starts with '<|' (e.g. <|im_end|>, <|im_start|>).
+            int32_t eot = tokenizer_.eos_chat_id();
+            if (token == eos || token == eot) return true;
+
             const std::string & raw = tokenizer_.raw_token(token);
+
+            // Gemma4 thinking channel: map <|channel> → <think>, <channel|> → </think>\n
+            if (raw == "<|channel>") {
+                if (req.stream) {
+                    auto chunks = emitter.emit_token("<think>");
+                    for (const auto & chunk : chunks)
+                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
+                }
+                return true;
+            }
+            if (raw == "<channel|>") {
+                if (req.stream) {
+                    auto chunks = emitter.emit_token("</think>\n");
+                    for (const auto & chunk : chunks)
+                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
+                }
+                return true;
+            }
+
+            // Skip other special tokens (starting with <|, or any <...> except byte-fallback)
             if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') return true;
+            if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
+                if (!(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x'))
+                    return true;
+            }
 
             std::string text = tokenizer_.token_text(token);
 
@@ -782,7 +805,15 @@ void HttpServer::worker_loop() {
             for (int32_t tok : result.tokens) {
                 const std::string & raw = tokenizer_.raw_token(tok);
                 if (tok == tokenizer_.eos_id()) continue;
+                if (tok == tokenizer_.eos_chat_id()) continue;
+                // Gemma4 channel → think mapping
+                if (raw == "<|channel>") { emitter.emit_token("<think>"); continue; }
+                if (raw == "<channel|>") { emitter.emit_token("</think>\n"); continue; }
                 if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') continue;
+                if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
+                    if (!(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x'))
+                        continue;
+                }
                 std::string text = tokenizer_.token_text(tok);
                 emitter.emit_token(text);
             }

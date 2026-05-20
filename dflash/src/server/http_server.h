@@ -99,6 +99,9 @@ public:
     // Set the optional pflash drafter tokenizer.
     void set_drafter_tokenizer(Tokenizer * tok) { drafter_tokenizer_ = tok; }
 
+    // Set the chat template format (detected from model arch).
+    void set_chat_format(ChatFormat fmt) { chat_format_ = fmt; }
+
     // Start listening. Blocks until shutdown() is called.
     int run();
 

@@ -230,7 +230,9 @@ static ggml_tensor * build_gemma4_attn_block(
         head_dim, kv_len, n_head_kv,
         cache_v->nb[1], cache_v->nb[2], 0);
 
-    const float kq_scale = 1.0f / std::sqrt((float)head_dim);
+    // Gemma4 uses self.scaling = 1.0 (no QK scaling) because Q/K are already
+    // RMS-normed per-head. Standard 1/sqrt(head_dim) is NOT used here.
+    const float kq_scale = 1.0f;
     ggml_tensor * use_mask = is_swa ? attn_mask_swa : attn_mask_full;
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, use_mask,
                                               kq_scale, 0.0f, 0.0f);

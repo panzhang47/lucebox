@@ -36,7 +36,8 @@ static const char QWEN3_TOOL_SUFFIX[] =
 
 ChatFormat chat_format_for_arch(const std::string & arch) {
     if (arch == "laguna") return ChatFormat::LAGUNA;
-    // qwen35, qwen3, gemma4 all use the Qwen3/ChatML format
+    if (arch == "gemma4") return ChatFormat::GEMMA4;
+    // qwen35, qwen3 use the Qwen3/ChatML format
     return ChatFormat::QWEN3;
 }
 
@@ -147,6 +148,40 @@ std::string render_chat_template(
         }
         if (add_generation_prompt) {
             result += "<｜Assistant｜>";
+        }
+        break;
+    }
+
+    case ChatFormat::GEMMA4: {
+        // Gemma4 format:
+        //   <bos><|turn>user\n{msg}<turn|>\n<|turn>model\n
+        // System messages are prepended to the first user message.
+        result = "<bos>";
+        std::string system_content;
+        size_t start_idx = 0;
+        if (!messages.empty() && messages[0].role == "system") {
+            system_content = messages[0].content;
+            start_idx = 1;
+        }
+
+        for (size_t i = start_idx; i < messages.size(); i++) {
+            const auto & msg = messages[i];
+            std::string role = msg.role;
+            if (role == "assistant") role = "model";
+
+            result += "<|turn>";
+            result += role;
+            result += '\n';
+            // Inject system content at the start of the first user message.
+            if (i == start_idx && !system_content.empty() && msg.role == "user") {
+                result += system_content;
+                result += "\n\n";
+            }
+            result += msg.content;
+            result += "<turn|>\n";
+        }
+        if (add_generation_prompt) {
+            result += "<|turn>model\n";
         }
         break;
     }

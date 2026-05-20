@@ -24,6 +24,7 @@ struct ChatMessage {
 enum class ChatFormat {
     QWEN3,     // <|im_start|>role\n...<|im_end|>\n
     LAGUNA,    // <|begin_of_sentence|><|User|>...<|Assistant|>
+    GEMMA4,    // <bos><|turn>role\n...<turn|>\n
 };
 
 // Render chat messages into the model-specific prompt string.

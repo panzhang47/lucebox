@@ -258,12 +258,27 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
     }
 
     const auto & snap = snapshots_[slot];
-    // Copy right-sized snapshot into full-size cache (position is outermost dim).
+    // Restore snapshot into cache per-head (cache: [D, max_ctx, Hk]).
     for (int il = 0; il < cache_.n_layer; ++il) {
         if (cache_.k[il] && snap.k_snap[il]) {
-            const size_t nbytes = ggml_nbytes(snap.k_snap[il]);
-            ggml_backend_tensor_set(cache_.k[il], snap.k_snap[il]->data, 0, nbytes);
-            ggml_backend_tensor_set(cache_.v[il], snap.v_snap[il]->data, 0, nbytes);
+            ggml_tensor * ck = cache_.k[il];
+            const int D   = (int)ck->ne[0];
+            const int Hk  = (int)ck->ne[2];
+            const int max_ctx = (int)ck->ne[1];
+            const int spos = snap.cur_pos;
+            const size_t elem_sz = ggml_element_size(ck);
+            const size_t head_bytes_src = (size_t)D * spos * elem_sz;
+            const size_t head_bytes_dst = (size_t)D * max_ctx * elem_sz;
+            const size_t copy_bytes     = head_bytes_src;
+
+            for (int h = 0; h < Hk; ++h) {
+                ggml_backend_tensor_set(cache_.k[il],
+                    (const char *)snap.k_snap[il]->data + h * head_bytes_src,
+                    h * head_bytes_dst, copy_bytes);
+                ggml_backend_tensor_set(cache_.v[il],
+                    (const char *)snap.v_snap[il]->data + h * head_bytes_src,
+                    h * head_bytes_dst, copy_bytes);
+            }
         }
     }
 
@@ -378,12 +393,13 @@ bool Gemma4Backend::snapshot_save(int slot) {
         snap.v_snap.resize(n_layer, nullptr);
         for (int il = 0; il < n_layer; ++il) {
             if (cache_.k[il]) {
-                // Right-sized: [D, Hk, snap_pos] instead of [D, Hk, max_ctx]
+                // Cache layout: [D, max_ctx, Hk]
+                // Snapshot: [D, snap_pos, Hk] — same axis order, truncated positions
                 ggml_tensor * ck = cache_.k[il];
                 snap.k_snap[il] = ggml_new_tensor_3d(snap.ctx, ck->type,
-                                                      ck->ne[0], ck->ne[1], snap_pos);
+                                                      ck->ne[0], snap_pos, ck->ne[2]);
                 snap.v_snap[il] = ggml_new_tensor_3d(snap.ctx, ck->type,
-                                                      ck->ne[0], ck->ne[1], snap_pos);
+                                                      ck->ne[0], snap_pos, ck->ne[2]);
             }
         }
 
@@ -395,12 +411,28 @@ bool Gemma4Backend::snapshot_save(int slot) {
         }
     }
 
-    // Copy first snap_pos positions (contiguous — position is outermost dim).
+    // Copy snap_pos positions per head.
+    // Cache: [D, max_ctx, Hk], Snap: [D, snap_pos, Hk]
+    // Per head h: copy D*snap_pos elements from cache offset h*D*max_ctx to snap offset h*D*snap_pos
     for (int il = 0; il < n_layer; ++il) {
         if (cache_.k[il] && snap.k_snap[il]) {
-            const size_t nbytes = ggml_nbytes(snap.k_snap[il]);
-            ggml_backend_tensor_get(cache_.k[il], snap.k_snap[il]->data, 0, nbytes);
-            ggml_backend_tensor_get(cache_.v[il], snap.v_snap[il]->data, 0, nbytes);
+            ggml_tensor * ck = cache_.k[il];
+            const int D   = (int)ck->ne[0];
+            const int Hk  = (int)ck->ne[2];
+            const int max_ctx = (int)ck->ne[1];
+            const size_t elem_sz = ggml_element_size(ck);
+            const size_t head_bytes_src = (size_t)D * max_ctx * elem_sz;
+            const size_t head_bytes_dst = (size_t)D * snap_pos * elem_sz;
+            const size_t copy_bytes     = head_bytes_dst;  // D * snap_pos * elem_sz per head
+
+            for (int h = 0; h < Hk; ++h) {
+                ggml_backend_tensor_get(cache_.k[il],
+                    (char *)snap.k_snap[il]->data + h * head_bytes_dst,
+                    h * head_bytes_src, copy_bytes);
+                ggml_backend_tensor_get(cache_.v[il],
+                    (char *)snap.v_snap[il]->data + h * head_bytes_dst,
+                    h * head_bytes_src, copy_bytes);
+            }
         }
     }
     snap.cur_pos = snap_pos;

@@ -46,6 +46,7 @@ public:
 
     // ─── Special tokens ──────────────────────────────────────────────
     int32_t eos_id() const { return eos_id_; }
+    int32_t eos_chat_id() const { return eos_chat_id_; }
     int32_t bos_id() const { return bos_id_; }
     int32_t vocab_size() const { return (int32_t)id_to_token_.size(); }
 
@@ -80,6 +81,10 @@ private:
     // Pre-tokenizer type
     enum class PreTokenizer { QWEN2, QWEN35 };
     PreTokenizer pre_type_ = PreTokenizer::QWEN35;
+
+    // Decode mode: SentencePiece tokens use UTF-8 with ▁ for space;
+    // GPT-2/BPE tokens use byte-level Unicode encoding.
+    bool is_sentencepiece_ = false;
 };
 
 }  // namespace dflash::common

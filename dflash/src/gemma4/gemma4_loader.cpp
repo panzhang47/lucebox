@@ -391,8 +391,10 @@ bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
         if (w.has_kv[il]) {
             const int D  = gemma4_head_dim(w, il);
             const int Hk = gemma4_n_head_kv(w, il);
-            out.k[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, Hk, max_ctx);
-            out.v[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, Hk, max_ctx);
+            // Layout: [head_dim, max_ctx, n_head_kv] — positions before heads
+            // (matches the view strides used in build_gemma4_attn_block)
+            out.k[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, max_ctx, Hk);
+            out.v[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, max_ctx, Hk);
             out.kv_source[il] = il;
             last_kv_layer = il;
         } else {
