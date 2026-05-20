@@ -57,18 +57,7 @@ HttpServer::~HttpServer() {
 }
 
 void HttpServer::shutdown() {
-    // Shutdown save: persist all tracked snapshot slots to disk.
-    if (!disk_cache_.disabled()) {
-        std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
-                     slot_tokens_.size());
-        for (auto & [slot, tokens] : slot_tokens_) {
-            if (backend_.snapshot_used(slot)) {
-                disk_cache_.learn_layout(slot);
-                disk_cache_.save(slot, tokens);
-            }
-        }
-    }
-
+    // Signal worker and accept loop to stop.
     stopping_.store(true);
     queue_cv_.notify_all();
     if (listen_fd_ >= 0) {
@@ -78,7 +67,8 @@ void HttpServer::shutdown() {
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
-    // Drain any remaining queued jobs so client threads don't wait forever.
+
+    // Drain any pending jobs.
     {
         std::lock_guard<std::mutex> lk(queue_mu_);
         while (queue_head_) {
@@ -90,6 +80,20 @@ void HttpServer::shutdown() {
             j->cv.notify_one();
         }
         queue_tail_ = nullptr;
+    }
+
+    // Shutdown save: persist all tracked snapshot slots to disk.
+    // Safe to access slot_tokens_ without locking — worker is joined.
+    if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
+        std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
+                     slot_tokens_.size());
+        for (auto & [slot, tokens] : slot_tokens_) {
+            if (backend_.snapshot_used(slot)) {
+                disk_cache_.learn_layout(slot);
+                disk_cache_.save(slot, tokens);
+            }
+        }
+        slot_tokens_.clear();
     }
 }
 
@@ -165,6 +169,9 @@ int HttpServer::run() {
         }).detach();
     }
 
+    // Wake the worker thread so it can observe stopping_ and exit.
+    queue_cv_.notify_all();
+
     // Wait for all client threads to finish.
     {
         std::unique_lock<std::mutex> lk(clients_mu_);
@@ -174,6 +181,19 @@ int HttpServer::run() {
     // Wait for worker to finish.
     if (worker_thread_.joinable()) {
         worker_thread_.join();
+    }
+
+    // Persist disk cache (worker joined — no race on slot_tokens_).
+    if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
+        std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
+                     slot_tokens_.size());
+        for (auto & [slot, tokens] : slot_tokens_) {
+            if (backend_.snapshot_used(slot)) {
+                disk_cache_.learn_layout(slot);
+                disk_cache_.save(slot, tokens);
+            }
+        }
+        slot_tokens_.clear();
     }
 
     return 0;

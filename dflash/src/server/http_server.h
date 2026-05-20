@@ -28,6 +28,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -103,6 +104,15 @@ public:
 
     // Signal the server to stop accepting new connections and drain.
     void shutdown();
+
+    // Async-signal-safe: only sets stopping flag and closes listen socket.
+    void request_stop() {
+        stopping_.store(true, std::memory_order_relaxed);
+        if (listen_fd_ >= 0) {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+        }
+    }
 
 private:
     // Client thread: read HTTP request, parse, enqueue job, wait.

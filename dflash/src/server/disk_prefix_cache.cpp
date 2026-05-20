@@ -108,10 +108,10 @@ static void write_u64(FILE * f, uint64_t v) { std::fwrite(&v, 8, 1, f); }
 static void write_i64(FILE * f, int64_t v)  { std::fwrite(&v, 8, 1, f); }
 static void write_u16(FILE * f, uint16_t v) { std::fwrite(&v, 2, 1, f); }
 
-static uint32_t read_u32(FILE * f) { uint32_t v = 0; std::fread(&v, 4, 1, f); return v; }
-static uint64_t read_u64(FILE * f) { uint64_t v = 0; std::fread(&v, 8, 1, f); return v; }
-static int64_t  read_i64(FILE * f) { int64_t v = 0;  std::fread(&v, 8, 1, f); return v; }
-static uint16_t read_u16(FILE * f) { uint16_t v = 0; std::fread(&v, 2, 1, f); return v; }
+static bool read_u32(FILE * f, uint32_t & out) { return std::fread(&out, 4, 1, f) == 1; }
+static bool read_u64(FILE * f, uint64_t & out) { return std::fread(&out, 8, 1, f) == 1; }
+static bool read_i64(FILE * f, int64_t & out)  { return std::fread(&out, 8, 1, f) == 1; }
+static bool read_u16(FILE * f, uint16_t & out) { return std::fread(&out, 2, 1, f) == 1; }
 
 // ─── Construction ───────────────────────────────────────────────────────
 
@@ -173,20 +173,35 @@ void DiskPrefixCache::compute_layout_id(ggml_context * ctx) {
 }
 
 void DiskPrefixCache::learn_layout(int slot) {
-    if (layout_known_ || disabled()) return;
+    if (disabled()) return;
+    if (layout_known_ && !layout_from_disk_) return;  // already verified from live model
 
     auto ref = backend_.snapshot_ref(slot);
     if (!ref.ctx) return;
 
+    std::array<uint8_t, 16> prev_id = layout_id_;
+    bool had_disk_layout = layout_from_disk_;
+
     compute_layout_id(ref.ctx);
+
+    if (had_disk_layout && std::memcmp(prev_id.data(), layout_id_.data(), 16) != 0) {
+        // Model layout differs from what was learned from disk files.
+        std::fprintf(stderr, "[disk-cache] layout mismatch: disk=%s model=%s — switching\n",
+                     hex(prev_id.data(), 16).c_str(),
+                     hex(layout_id_.data(), 16).c_str());
+        entries_.clear();
+        total_bytes_ = 0;
+    }
+
     layout_known_ = true;
+    layout_from_disk_ = false;
     layout_dir_ = config_.cache_dir + "/" + hex(layout_id_.data(), 16);
     mkdir_p(layout_dir_);
 
     std::fprintf(stderr, "[disk-cache] layout learned: %s\n",
                  hex(layout_id_.data(), 16).c_str());
 
-    // Now scan for any previously saved files.
+    // Scan for previously saved files matching this layout.
     scan_directory();
 }
 
@@ -272,6 +287,7 @@ void DiskPrefixCache::try_learn_from_disk() {
             if (read_header(f, hdr) && std::memcmp(hdr.magic, "DKVC", 4) == 0) {
                 std::memcpy(layout_id_.data(), hdr.layout_id, 16);
                 layout_known_ = true;
+                layout_from_disk_ = true;  // unverified — must be confirmed by learn_layout()
                 layout_dir_ = subdir;
                 std::fclose(f);
                 closedir(sub);
@@ -289,7 +305,7 @@ void DiskPrefixCache::try_learn_from_disk() {
 // ─── Lookup ─────────────────────────────────────────────────────────────
 
 bool DiskPrefixCache::lookup(const std::vector<int32_t> & prompt_ids, int slot) {
-    if (disabled() || !layout_known_) return false;
+    if (disabled() || !layout_known_ || layout_from_disk_) return false;
 
     PrefixHash hash = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
 
@@ -595,14 +611,19 @@ bool DiskPrefixCache::read_file(const std::string & path, int slot) {
     table.reserve(hdr.n_tensors);
     for (uint32_t i = 0; i < hdr.n_tensors; ++i) {
         DiskTensorEntry ent;
-        uint16_t name_len = read_u16(f);
+        uint16_t name_len;
+        if (!read_u16(f, name_len)) { std::fclose(f); return false; }
         if (name_len >= GGML_MAX_NAME) { std::fclose(f); return false; }
         char name_buf[GGML_MAX_NAME] = {};
         if (std::fread(name_buf, 1, name_len, f) != name_len) { std::fclose(f); return false; }
         ent.name = name_buf;
-        ent.type = read_u32(f);
-        for (int d = 0; d < 4; ++d) ent.ne[d] = read_i64(f);
-        ent.nbytes = (size_t)read_u64(f);
+        if (!read_u32(f, ent.type)) { std::fclose(f); return false; }
+        for (int d = 0; d < 4; ++d) {
+            if (!read_i64(f, ent.ne[d])) { std::fclose(f); return false; }
+        }
+        uint64_t nbytes_raw;
+        if (!read_u64(f, nbytes_raw)) { std::fclose(f); return false; }
+        ent.nbytes = (size_t)nbytes_raw;
         table.push_back(std::move(ent));
     }
 
@@ -693,17 +714,19 @@ bool DiskPrefixCache::write_header(FILE * f, const DiskCacheHeader & hdr) {
 
 bool DiskPrefixCache::read_header(FILE * f, DiskCacheHeader & hdr) {
     if (std::fread(hdr.magic, 1, 4, f) != 4) return false;
-    hdr.version = read_u32(f);
+    if (!read_u32(f, hdr.version)) return false;
     if (std::fread(hdr.layout_id, 1, 16, f) != 16) return false;
-    hdr.cur_pos       = read_u32(f);
-    hdr.n_tensors     = read_u32(f);
-    hdr.token_count   = read_u32(f);
+    if (!read_u32(f, hdr.cur_pos)) return false;
+    if (!read_u32(f, hdr.n_tensors)) return false;
+    if (!read_u32(f, hdr.token_count)) return false;
     if (std::fread(hdr.token_hash, 1, 16, f) != 16) return false;
-    hdr.payload_bytes = read_u64(f);
-    hdr.created_at    = read_u64(f);
-    hdr.last_used     = read_u64(f);
-    hdr.last_tok      = (int32_t)read_u32(f);
-    return !std::ferror(f);
+    if (!read_u64(f, hdr.payload_bytes)) return false;
+    if (!read_u64(f, hdr.created_at)) return false;
+    if (!read_u64(f, hdr.last_used)) return false;
+    uint32_t last_tok_raw;
+    if (!read_u32(f, last_tok_raw)) return false;
+    hdr.last_tok = (int32_t)last_tok_raw;
+    return true;
 }
 
 }  // namespace dflash27b

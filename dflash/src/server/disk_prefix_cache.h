@@ -3,7 +3,7 @@
 // Complements the in-memory PrefixCache by serializing snapshot tensors to
 // files, enabling cache survival across restarts and overflow to disk.
 //
-// File format: 64-byte header + tensor table + raw tensor data.
+// File format: 80-byte header + tensor table + raw tensor data.
 // Files are keyed by SHA-1 of prompt token IDs (same as in-memory cache).
 // A layout fingerprint (SHA-1 of tensor names/types/shapes) prevents loading
 // snapshots from incompatible models.
@@ -33,7 +33,7 @@ struct DiskCacheConfig {
     int         cold_max_tokens = 10240;    // create cold checkpoint for prompts longer than this
 };
 
-// ─── File header (64 bytes, little-endian) ──────────────────────────────
+// ─── File header (80 bytes, little-endian) ──────────────────────────────
 
 struct DiskCacheHeader {
     char     magic[4];          // "DKVC"
@@ -131,6 +131,7 @@ private:
     // Layout fingerprint (learned from first snapshot).
     std::array<uint8_t, 16> layout_id_{};
     bool layout_known_ = false;
+    bool layout_from_disk_ = false;  // true if learned from file, unverified
     std::string layout_dir_;  // <cache_dir>/<fingerprint_hex>/
 
     // In-memory index of on-disk files.

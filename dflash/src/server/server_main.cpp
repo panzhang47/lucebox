@@ -30,7 +30,7 @@ static HttpServer * g_server = nullptr;
 static void signal_handler(int sig) {
     (void)sig;
     if (g_server) {
-        g_server->shutdown();
+        g_server->request_stop();
     }
 }
 
