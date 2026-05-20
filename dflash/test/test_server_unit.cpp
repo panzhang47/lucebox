@@ -73,9 +73,36 @@ static const char * current_test = nullptr;
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
 
-static SseEmitter make_emitter(ApiFormat fmt, bool thinking = false) {
+static json weather_tools() {
+    return json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "get_weather"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"location", {{"type", "string"}}},
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}},
+        {{"type", "function"},
+         {"function", {
+             {"name", "terminal"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+}
+
+static SseEmitter make_emitter(ApiFormat fmt, bool thinking = false,
+                               json tools = json::array()) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
-                      json::array(), nullptr, thinking);
+                      tools, nullptr, thinking);
 }
 
 // Concatenate all SSE chunks into a single string.
@@ -336,7 +363,7 @@ static void test_emitter_content_only_no_thinking() {
 
 static void test_emitter_tool_buffer_detection() {
     // When the emitter sees <tool_call>, it should buffer and parse tools.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false, weather_tools());
     em.emit_start();
     em.emit_token("<tool_call>\n"
                   "<function=get_weather>\n"
@@ -390,6 +417,75 @@ static void test_emitter_anthropic_tool_use_blocks() {
         n_stop++; pos++;
     }
     TEST_ASSERT(n_stop >= 2);
+}
+
+static void test_emitter_bare_function_tool_buffer_detection() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false, weather_tools());
+    em.emit_start();
+    em.emit_token("<function=terminal>\n"
+                  "<parameter=command>\n"
+                  "ls -la /tmp/lop/\n"
+                  "</parameter>\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "terminal");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la /tmp/lop/");
+    }
+    TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
+}
+
+static void test_emitter_does_not_leak_malformed_tool_xml() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false, weather_tools());
+    em.emit_start();
+    em.emit_token("Let me list files.\n\n");
+    em.emit_token("<tool_call>\n"
+                  "<function=terminal>\n"
+                  "<parameter=command>\n"
+                  "ls -la /tmp/lop/\n"
+                  "</parameter>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().find("Let me list files.") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<tool_call>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
+}
+
+static void test_emitter_parses_tool_call_missing_outer_close() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false, weather_tools());
+    em.emit_start();
+    em.emit_token("<tool_call>\n"
+                  "<function=terminal>\n"
+                  "<parameter=command>\n"
+                  "ls -la /tmp/lop/\n"
+                  "</parameter>\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "terminal");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la /tmp/lop/");
+    }
+    TEST_ASSERT(em.accumulated_text().find("<tool_call>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
+}
+
+static void test_emitter_no_tools_keeps_tool_like_text() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    em.emit_start();
+    em.emit_token("<function=terminal>\n"
+                  "<parameter=command>ls</parameter>\n"
+                  "</function>");
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().find("<function=terminal>") != std::string::npos);
 }
 
 static void test_emitter_anthropic_structure() {
@@ -1590,6 +1686,10 @@ int main() {
     RUN_TEST(test_emitter_content_only_no_thinking);
     RUN_TEST(test_emitter_tool_buffer_detection);
     RUN_TEST(test_emitter_anthropic_tool_use_blocks);
+    RUN_TEST(test_emitter_bare_function_tool_buffer_detection);
+    RUN_TEST(test_emitter_does_not_leak_malformed_tool_xml);
+    RUN_TEST(test_emitter_parses_tool_call_missing_outer_close);
+    RUN_TEST(test_emitter_no_tools_keeps_tool_like_text);
     RUN_TEST(test_emitter_anthropic_structure);
     RUN_TEST(test_emitter_responses_structure);
     RUN_TEST(test_emitter_responses_bare_function_tool_call);
