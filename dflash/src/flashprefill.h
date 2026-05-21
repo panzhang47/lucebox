@@ -63,8 +63,8 @@ int flash_prefill_forward_bf16(
 
 // Same as flash_prefill_forward_bf16 but operates on F16 (half) tensors.
 // Uses F16 WMMA (m16n8k16) and cooperative shared-memory loads.
-// Compiled when DFLASH27B_HAVE_VOLTA_FLASHPREFILL is defined.
-#ifdef DFLASH27B_HAVE_VOLTA_FLASHPREFILL
+// Compiled when the Volta/Turing WMMA or Pascal scalar F16 path is enabled.
+#if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) || defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
 int flash_prefill_forward_f16(
     const void * Q, const void * K, const void * V, void * O,
     int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
