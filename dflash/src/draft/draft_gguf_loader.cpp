@@ -143,9 +143,11 @@ bool load_draft_gguf(const std::string & path,
         }
         const char * arch = gguf_get_val_str(gctx, arch_id);
         arch_s = arch;
-        if (arch_s != "qwen35-dflash-draft" && arch_s != "dflash-draft") {
+        if (arch_s != "qwen35-dflash-draft" &&
+            arch_s != "dflash-draft" &&
+            arch_s != "gemma4-dflash-draft") {
             set_last_error(std::string("unexpected draft arch: ") + arch +
-                           " (expected qwen35-dflash-draft or dflash-draft)");
+                           " (expected qwen35-dflash-draft, dflash-draft, or gemma4-dflash-draft)");
             gguf_free(gctx);
             return false;
         }
