@@ -83,6 +83,8 @@ struct ParsedRequest {
     std::string               model;
     // Tool definitions (stored as JSON for response formatting)
     json                      tools;
+    // Tool choice constraint (stored for hint generation)
+    json                      tool_choice;
     // Original messages (for response formatting)
     json                      messages;
     // Response ID

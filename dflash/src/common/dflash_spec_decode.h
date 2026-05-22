@@ -37,6 +37,10 @@ struct DraftWeights;  // forward-decl from internal.h
 //
 // `remote_draft`, when active, replaces local draft compute with an IPC
 // round-trip to a separate draft process.
+//
+// `hint_tokens`, when non-null, provides pre-known token IDs that override
+// draft proposals at corresponding generation positions. Used for tool call
+// hints where structural tokens are predictable with ~100% confidence.
 bool run_dflash_spec_decode(
         DFlashTarget & target,
         DraftWeights & draft_weights,
@@ -48,6 +52,7 @@ bool run_dflash_spec_decode(
         const char * out_path,
         int draft_ctx_max,
         int stream_fd = -1,
-        DFlashDraftIpcClient * remote_draft = nullptr);
+        DFlashDraftIpcClient * remote_draft = nullptr,
+        const std::vector<int32_t> * hint_tokens = nullptr);
 
 } // namespace dflash::common

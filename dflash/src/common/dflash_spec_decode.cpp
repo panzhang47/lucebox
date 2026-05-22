@@ -33,7 +33,8 @@ bool run_dflash_spec_decode(
         const char * out_path,
         int draft_ctx_max,
         int stream_fd,
-        DFlashDraftIpcClient * remote_draft) {
+        DFlashDraftIpcClient * remote_draft,
+        const std::vector<int32_t> * hint_tokens) {
     const bool use_remote_draft = remote_draft && remote_draft->active();
     if (!use_remote_draft && !feature_ring.target_feat) return false;
 
@@ -57,6 +58,8 @@ bool run_dflash_spec_decode(
     int n_generated     = 0;
     int n_draft_steps   = 0;
     int n_accept_sum    = 0;
+    int n_hint_proposed = 0;
+    int n_hint_accepted = 0;
 
     auto t_dec0 = std::chrono::steady_clock::now();
     while (n_generated < n_gen) {
@@ -131,6 +134,18 @@ bool run_dflash_spec_decode(
         }
         draft_tok[0] = last_tok;
 
+        // ── Tool call hint injection ──────────────────────────────────────
+        // Override draft tokens with pre-known hint tokens for near-100%
+        // acceptance on predictable structural positions.
+        int hint_filled = 0;
+        if (hint_tokens && n_generated < (int)hint_tokens->size()) {
+            const int hint_avail = (int)hint_tokens->size() - n_generated;
+            hint_filled = std::min(hint_avail, q_len - 1);
+            for (int i = 0; i < hint_filled; i++) {
+                draft_tok[1 + i] = (*hint_tokens)[n_generated + i];
+            }
+        }
+
         // ── Verify pass: speculative target forward over q_len tokens ────
         if (!target.snapshot_kv()) {
             std::fprintf(stderr, "dflash-spec snapshot_kv failed\n");
@@ -153,6 +168,11 @@ bool run_dflash_spec_decode(
         for (int i = 0; i < q_len - 1; i++) {
             if (draft_tok[i + 1] == target_tok[i]) accept_n++;
             else break;
+        }
+        // Track hint acceptance telemetry.
+        if (hint_filled > 0) {
+            n_hint_proposed += hint_filled;
+            n_hint_accepted += std::min(hint_filled, accept_n - 1);
         }
         int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
         int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
@@ -200,6 +220,11 @@ bool run_dflash_spec_decode(
     std::printf("[target-split-dflash] %d draft steps, accepted=%d/%d (%.1f%%), avg commit/step=%.2f\n",
                 n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
                 n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+    if (n_hint_proposed > 0) {
+        std::printf("[target-split-dflash] hint tokens: %d/%d accepted (%.1f%%)\n",
+                    n_hint_accepted, n_hint_proposed,
+                    100.0 * (double)n_hint_accepted / (double)n_hint_proposed);
+    }
     if (out_path) write_int32_file(out_path, out_all);
 
     return true;

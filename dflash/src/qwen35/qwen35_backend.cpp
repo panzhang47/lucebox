@@ -493,7 +493,7 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     // Decode (speculative)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io)) {
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
             result.error = "decode";
             return result;
         }
@@ -554,7 +554,7 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io)) {
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
             result.error = "decode";
             return result;
         }
@@ -789,7 +789,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
-                                    const DaemonIO & io) {
+                                    const DaemonIO & io,
+                                    const std::vector<int32_t> * hint_tokens) {
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -835,6 +836,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_generated     = 0;
     int n_draft_steps   = 0;
     int n_accept_sum    = 0;
+    int n_hint_proposed = 0;
+    int n_hint_accepted = 0;
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
@@ -906,6 +909,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         draft_tok[0] = last_tok;
 
+        // 3b. Tool call hint injection: override draft tokens with pre-known
+        // structural tokens for near-100% acceptance.
+        int hint_fill = 0;
+        if (hint_tokens && n_generated < (int)hint_tokens->size()) {
+            const int hint_avail = (int)hint_tokens->size() - n_generated;
+            hint_fill = std::min(hint_avail, q_len - 1);
+            for (int i = 0; i < hint_fill; i++) {
+                draft_tok[1 + i] = (*hint_tokens)[n_generated + i];
+            }
+        }
+
         // 4. Verify: snapshot KV, run target forward over draft tokens
         if (!target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
@@ -925,6 +939,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         for (int i = 0; i < q_len - 1; i++) {
             if (draft_tok[i + 1] == target_tok[i]) accept_n++;
             else break;
+        }
+        // Track hint acceptance telemetry.
+        if (hint_fill > 0) {
+            n_hint_proposed += hint_fill;
+            n_hint_accepted += std::min(hint_fill, accept_n - 1);
         }
         int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
         int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
@@ -988,6 +1007,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
                  n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+    if (n_hint_proposed > 0) {
+        std::fprintf(stderr, "[spec-decode] hint tokens: %d/%d accepted (%.1f%%)\n",
+                     n_hint_accepted, n_hint_proposed,
+                     100.0 * (double)n_hint_accepted / (double)n_hint_proposed);
+    }
 
     io.emit(-1);
     return true;

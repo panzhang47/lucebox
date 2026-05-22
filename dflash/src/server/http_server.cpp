@@ -5,6 +5,7 @@
 
 #include "http_server.h"
 #include "sse_emitter.h"
+#include "tool_hint.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -300,6 +301,10 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // Tools.
         if (body.contains("tools")) {
             req.tools = body["tools"];
+        }
+        // Tool choice constraint for hint generation.
+        if (body.contains("tool_choice")) {
+            req.tool_choice = body["tool_choice"];
         }
 
         // Stop sequences — OpenAI uses "stop" (string or array), Anthropic uses "stop_sequences" (array).
@@ -654,6 +659,18 @@ void HttpServer::worker_loop() {
         gen_req.sampler = req.sampler;
         gen_req.do_sample = req.sampler.temp > 0.0f;
         gen_req.stream = false;  // we handle streaming via on_token callback
+
+        // Tool call hint generation: pre-tokenize predictable structural tokens
+        // to accelerate spec decode when tool_choice constrains the output.
+        std::vector<int32_t> hint_tokens_storage;
+        if (!req.tools.empty() && !req.tool_choice.is_null()) {
+            ToolHintGenerator hint_gen(tokenizer_);
+            auto hint = hint_gen.build_hint(req.tools, req.tool_choice);
+            if (!hint.empty()) {
+                hint_tokens_storage = std::move(hint.prefix_tokens);
+                gen_req.hint_tokens = &hint_tokens_storage;
+            }
+        }
 
         // Prefix cache: check for cached KV state.
         auto [cache_slot, prefix_len] = prefix_cache_.lookup(effective_prompt);

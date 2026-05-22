@@ -172,7 +172,8 @@ private:
     // Speculative decode loop: draft → verify → accept until EOS/max.
     bool do_spec_decode(int committed, int n_gen,
                         std::vector<int32_t> & out_tokens,
-                        const DaemonIO & io);
+                        const DaemonIO & io,
+                        const std::vector<int32_t> * hint_tokens = nullptr);
 
     // AR decode fallback (no draft model or sampling mode).
     bool do_ar_decode(int committed, int n_gen,

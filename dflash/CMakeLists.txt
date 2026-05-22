@@ -260,6 +260,7 @@ add_library(dflash_common STATIC
     src/server/tokenizer.cpp
     src/server/chat_template.cpp
     src/server/tool_parser.cpp
+    src/server/tool_hint.cpp
     src/server/reasoning.cpp
     src/server/tool_memory.cpp
     src/server/sse_emitter.cpp

@@ -60,6 +60,11 @@ struct GenerateRequest {
     // immediately. This is the primary mechanism for client-disconnect
     // cancellation in the native HTTP server.
     TokenCallback              on_token;
+    // Tool call hint tokens: pre-tokenized structural tokens that are
+    // predictable with ~100% confidence (XML tags, function name, param names).
+    // When non-null, the spec decode loop uses these as draft overrides,
+    // bypassing draft model computation for covered positions.
+    const std::vector<int32_t> * hint_tokens = nullptr;
 };
 
 struct GenerateResult {
