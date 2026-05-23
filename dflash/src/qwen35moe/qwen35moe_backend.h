@@ -42,6 +42,7 @@ private:
     Qwen35MoeSwapPolicy swap_policy_;
     uint64_t last_hot_selected_ = 0;
     uint64_t last_cold_selected_ = 0;
+    bool hybrid_telemetry_ = false;
 
     void maybe_post_request_swap();
 };

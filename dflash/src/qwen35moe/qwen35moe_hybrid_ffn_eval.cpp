@@ -4,11 +4,18 @@
 
 #include "ggml-alloc.h"
 
+#include <chrono>
 #include <cmath>
 
 namespace dflash::common {
 
 namespace {
+
+using HybridClock = std::chrono::steady_clock;
+
+static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_point end) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
 
 static bool run_routed_subset(ggml_backend_t backend,
                               ggml_tensor * gate_tensor,
@@ -233,7 +240,11 @@ bool eval_qwen35moe_hybrid_ffn_single(
     const float *                       selected_weights,
     int                                 n_selected,
     std::vector<float> &                out,
+    Qwen35MoeHybridFfnTelemetry *       telemetry,
     std::string *                       err) {
+    if (telemetry) *telemetry = {};
+    const auto ffn_wall_t0 = HybridClock::now();
+    const auto partition_t0 = HybridClock::now();
     std::vector<int32_t> hot_ids;
     std::vector<float> hot_weights;
     std::vector<int32_t> cold_ids;
@@ -256,8 +267,15 @@ bool eval_qwen35moe_hybrid_ffn_single(
             cold_weights.push_back(selected_weights[i]);
         }
     }
+    const auto partition_t1 = HybridClock::now();
+    if (telemetry) {
+        telemetry->partition_us = elapsed_us(partition_t0, partition_t1);
+        telemetry->hot_selected = (int)hot_ids.size();
+        telemetry->cold_selected = (int)cold_ids.size();
+    }
 
     std::vector<float> hot, cold, shared;
+    const auto hot_t0 = HybridClock::now();
     if (!run_routed_subset(gpu_backend,
                            L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps, L.ffn_gate_up_exps,
                            L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
@@ -269,6 +287,9 @@ bool eval_qwen35moe_hybrid_ffn_single(
                            hot, err)) {
         return false;
     }
+    const auto hot_t1 = HybridClock::now();
+    if (telemetry) telemetry->hot_us = elapsed_us(hot_t0, hot_t1);
+    const auto cold_t0 = HybridClock::now();
     if (!run_routed_subset(cpu_backend,
                            storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                            L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
@@ -280,13 +301,26 @@ bool eval_qwen35moe_hybrid_ffn_single(
                            cold, err)) {
         return false;
     }
+    const auto cold_t1 = HybridClock::now();
+    if (telemetry) {
+        telemetry->cold_us = cold_ids.empty() ? 0 : elapsed_us(cold_t0, cold_t1);
+    }
+    const auto shared_t0 = HybridClock::now();
     if (!run_shared_ffn_gpu(gpu_backend, L, w.n_embd, cur_host, shared, err)) {
         return false;
     }
+    const auto shared_t1 = HybridClock::now();
+    if (telemetry) telemetry->shared_us = elapsed_us(shared_t0, shared_t1);
 
+    const auto combine_t0 = HybridClock::now();
     out.assign((size_t)w.n_embd, 0.0f);
     for (int i = 0; i < w.n_embd; ++i) {
         out[(size_t)i] = hot[(size_t)i] + cold[(size_t)i] + shared[(size_t)i];
+    }
+    const auto combine_t1 = HybridClock::now();
+    if (telemetry) {
+        telemetry->combine_us = elapsed_us(combine_t0, combine_t1);
+        telemetry->ffn_wall_us = elapsed_us(ffn_wall_t0, combine_t1);
     }
     return true;
 }

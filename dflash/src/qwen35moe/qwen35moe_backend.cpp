@@ -4,10 +4,21 @@
 
 #include "ggml-alloc.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
 namespace dflash::common {
+
+namespace {
+
+using HybridClock = std::chrono::steady_clock;
+
+static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_point end) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+} // namespace
 
 Qwen35MoeBackend::Qwen35MoeBackend(const Qwen35Config & cfg)
     : Qwen35Backend(cfg) {}
@@ -29,6 +40,9 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
     const char * placement_path = std::getenv("DFLASH_QWEN35MOE_PLACEMENT");
     if (!placement_path || !placement_path[0]) {
         return true;
+    }
+    if (const char * telemetry = std::getenv("DFLASH_QWEN35MOE_TELEMETRY")) {
+        hybrid_telemetry_ = std::atoi(telemetry) != 0;
     }
 
     Qwen35MoeExpertPlacement placement;
@@ -144,6 +158,18 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
     std::string err;
     uint64_t hot_selected_total = 0;
     uint64_t cold_selected_total = 0;
+    uint64_t decode_prefn_us = 0;
+    uint64_t decode_ffn_wall_us = 0;
+    uint64_t decode_ffn_partition_us = 0;
+    uint64_t decode_ffn_hot_us = 0;
+    uint64_t decode_ffn_cold_us = 0;
+    uint64_t decode_ffn_shared_us = 0;
+    uint64_t decode_ffn_combine_us = 0;
+    uint64_t decode_logits_us = 0;
+    uint64_t cold_layer_calls = 0;
+    uint64_t hot_only_layer_calls = 0;
+    uint64_t layer_calls = 0;
+    const auto decode_t0 = HybridClock::now();
 
     auto project_logits = [&](const float * hidden_host) -> bool {
         StepGraph proj_sg;
@@ -201,6 +227,7 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
         if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) return false;
 
         for (int il = 0; il < target_weights().n_layer; ++il) {
+            const auto prefn_t0 = HybridClock::now();
             if (!build_layer_prefn_step(layer_sg, target_weights(), target_cache(), target_backend(),
                                         il, committed, /*n_tokens=*/1,
                                         /*with_mask=*/false, /*fa_window=*/0, cfg_.kq_stride_pad)) {
@@ -235,16 +262,37 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
             if (routing_stats_) {
                 routing_stats_->observe(il, selected.data(), (int)selected.size());
             }
+            const auto prefn_t1 = HybridClock::now();
+            decode_prefn_us += elapsed_us(prefn_t0, prefn_t1);
 
+            Qwen35MoeHybridFfnTelemetry ffn_telemetry;
+            const auto ffn_t0 = HybridClock::now();
             if (!eval_qwen35moe_hybrid_ffn_single(target_backend(), target_weights(),
                                                   target_weights().layers[(size_t)il], storage,
                                                   target_weights().moe_hybrid->cpu_backend,
                                                   post.data(), selected.data(), weights.data(),
-                                                  (int)selected.size(), ffn_out, &err)) {
+                                                  (int)selected.size(), ffn_out,
+                                                  hybrid_telemetry_ ? &ffn_telemetry : nullptr,
+                                                  &err)) {
                 std::fprintf(stderr, "[qwen35moe] hybrid FFN eval failed layer=%d: %s\n",
                              il, err.c_str());
                 step_graph_destroy(layer_sg);
                 return false;
+            }
+            const auto ffn_t1 = HybridClock::now();
+            decode_ffn_wall_us += elapsed_us(ffn_t0, ffn_t1);
+            if (hybrid_telemetry_) {
+                decode_ffn_partition_us += ffn_telemetry.partition_us;
+                decode_ffn_hot_us += ffn_telemetry.hot_us;
+                decode_ffn_cold_us += ffn_telemetry.cold_us;
+                decode_ffn_shared_us += ffn_telemetry.shared_us;
+                decode_ffn_combine_us += ffn_telemetry.combine_us;
+                layer_calls++;
+                if (ffn_telemetry.cold_selected > 0) {
+                    cold_layer_calls++;
+                } else if (ffn_telemetry.hot_selected > 0) {
+                    hot_only_layer_calls++;
+                }
             }
             for (int i = 0; i < hidden; ++i) {
                 act_next[(size_t)i] = residual[(size_t)i] + ffn_out[(size_t)i];
@@ -261,10 +309,13 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
             act_cur.swap(act_next);
         }
 
+        const auto logits_t0 = HybridClock::now();
         if (!project_logits(act_cur.data())) {
             step_graph_destroy(layer_sg);
             return false;
         }
+        const auto logits_t1 = HybridClock::now();
+        decode_logits_us += elapsed_us(logits_t0, logits_t1);
         int32_t next_tok;
         if (sampler_config().temp > 0) {
             next_tok = sample_logits(logits_buf.data(), vocab, sampler_config(),
@@ -292,6 +343,41 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
     std::printf("[qwen35moe] hybrid decode stats: hot_selected=%llu cold_selected=%llu\n",
                 (unsigned long long)last_hot_selected_,
                 (unsigned long long)last_cold_selected_);
+    if (hybrid_telemetry_) {
+        const uint64_t decode_us = elapsed_us(decode_t0, HybridClock::now());
+        const uint64_t accounted_ffn_us = decode_ffn_partition_us + decode_ffn_hot_us +
+                                          decode_ffn_cold_us + decode_ffn_shared_us +
+                                          decode_ffn_combine_us;
+        const uint64_t ffn_misc_us = decode_ffn_wall_us > accounted_ffn_us
+            ? (decode_ffn_wall_us - accounted_ffn_us) : 0;
+        const uint64_t cpu_skipped_layer_calls = layer_calls > cold_layer_calls
+            ? (layer_calls - cold_layer_calls) : 0;
+        const double cold_share_decode = decode_us > 0
+            ? (100.0 * (double)decode_ffn_cold_us / (double)decode_us) : 0.0;
+        const double cold_share_ffn = decode_ffn_wall_us > 0
+            ? (100.0 * (double)decode_ffn_cold_us / (double)decode_ffn_wall_us) : 0.0;
+        std::printf("[qwen35moe] hybrid telemetry: decode_ms=%.2f prefn_ms=%.2f logits_ms=%.2f "
+                    "ffn_wall_ms=%.2f hot_gpu_ms=%.2f cold_cpu_ms=%.2f shared_gpu_ms=%.2f "
+                    "partition_ms=%.2f combine_ms=%.2f ffn_misc_ms=%.2f "
+                    "cold_share_decode=%.1f%% cold_share_ffn=%.1f%% layer_calls=%llu "
+                    "cold_layer_calls=%llu hot_only_layer_calls=%llu cpu_skipped_layer_calls=%llu\n",
+                    decode_us / 1000.0,
+                    decode_prefn_us / 1000.0,
+                    decode_logits_us / 1000.0,
+                    decode_ffn_wall_us / 1000.0,
+                    decode_ffn_hot_us / 1000.0,
+                    decode_ffn_cold_us / 1000.0,
+                    decode_ffn_shared_us / 1000.0,
+                    decode_ffn_partition_us / 1000.0,
+                    decode_ffn_combine_us / 1000.0,
+                    ffn_misc_us / 1000.0,
+                    cold_share_decode,
+                    cold_share_ffn,
+                    (unsigned long long)layer_calls,
+                    (unsigned long long)cold_layer_calls,
+                    (unsigned long long)hot_only_layer_calls,
+                    (unsigned long long)cpu_skipped_layer_calls);
+    }
     return true;
 }
 

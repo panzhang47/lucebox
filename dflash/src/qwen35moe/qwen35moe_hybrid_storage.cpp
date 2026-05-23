@@ -138,6 +138,7 @@ bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
         if (err) *err = "failed to init cpu backend";
         return false;
     }
+    ggml_backend_cpu_set_n_threads(tmp.cpu_backend, std::max(1, std::min(w.n_expert_used, 8)));
 
     for (int il = 0; il < w.n_layer; ++il) {
         const TargetLayer & L = w.layers[(size_t)il];

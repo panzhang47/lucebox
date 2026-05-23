@@ -93,7 +93,7 @@ int main(int argc, char ** argv) {
     }
     if (!eval_qwen35moe_hybrid_ffn_single(backend, w, L, storage, hybrid.cpu_backend,
                                           cur.data(), selected_ids, selected_weights, 2,
-                                          hybrid_out, &err)) {
+                                          hybrid_out, nullptr, &err)) {
         std::fprintf(stderr, "hybrid ffn failed: %s\n", err.c_str());
         return 1;
     }
