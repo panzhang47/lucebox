@@ -498,8 +498,11 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     uint64_t embed_us_total = 0, logits_us_total = 0;
     Qwen35MoeHybridFfnTelemetry ffn_tel_accum{};
 
+    StepGraph logits_sg;  // Persistent logits graph (built once, reused every token)
+
     auto cleanup_graphs = [&]() {
         step_graph_destroy(layer_sg);
+        step_graph_destroy(logits_sg);
         for (auto & sg : cached_prefn) step_graph_destroy(sg);
     };
 
@@ -581,36 +584,34 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
         return true;
     };
 
-    // Helper: compute logits from act_cur
+    // Helper: compute logits from act_cur (persistent graph, built once)
     auto compute_logits = [&]() -> bool {
-        StepGraph proj_sg;
-        ggml_init_params ip{};
-        ip.mem_size   = 64 * 1024 * 1024;
-        ip.mem_buffer = nullptr;
-        ip.no_alloc   = true;
-        proj_sg.ctx = ggml_init(ip);
-        if (!proj_sg.ctx) return false;
-        proj_sg.hidden_input = ggml_new_tensor_3d(proj_sg.ctx, GGML_TYPE_F32, hidden, 1, 1);
-        ggml_set_input(proj_sg.hidden_input);
-        proj_sg.gf = ggml_new_graph_custom(proj_sg.ctx, 1024, false);
-        ggml_tensor * normed = ggml_rms_norm(proj_sg.ctx, proj_sg.hidden_input, target_weights().rms_eps);
-        normed = ggml_mul(proj_sg.ctx, normed, target_weights().out_norm);
-        proj_sg.logits = ggml_mul_mat(proj_sg.ctx, target_weights().output, normed);
-        ggml_set_output(proj_sg.logits);
-        ggml_build_forward_expand(proj_sg.gf, proj_sg.logits);
-        proj_sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend()));
-        if (!ggml_gallocr_alloc_graph(proj_sg.alloc, proj_sg.gf)) {
-            step_graph_destroy(proj_sg);
-            return false;
+        if (!logits_sg.ctx) {
+            // First call: build the logits graph
+            ggml_init_params ip{};
+            ip.mem_size   = 64 * 1024 * 1024;
+            ip.mem_buffer = nullptr;
+            ip.no_alloc   = true;
+            logits_sg.ctx = ggml_init(ip);
+            if (!logits_sg.ctx) return false;
+            logits_sg.hidden_input = ggml_new_tensor_3d(logits_sg.ctx, GGML_TYPE_F32, hidden, 1, 1);
+            ggml_set_input(logits_sg.hidden_input);
+            logits_sg.gf = ggml_new_graph_custom(logits_sg.ctx, 1024, false);
+            ggml_tensor * normed = ggml_rms_norm(logits_sg.ctx, logits_sg.hidden_input, target_weights().rms_eps);
+            normed = ggml_mul(logits_sg.ctx, normed, target_weights().out_norm);
+            logits_sg.logits = ggml_mul_mat(logits_sg.ctx, target_weights().output, normed);
+            ggml_set_output(logits_sg.logits);
+            ggml_build_forward_expand(logits_sg.gf, logits_sg.logits);
+            logits_sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend()));
+            if (!ggml_gallocr_alloc_graph(logits_sg.alloc, logits_sg.gf)) {
+                step_graph_destroy(logits_sg);
+                return false;
+            }
         }
-        ggml_backend_tensor_set(proj_sg.hidden_input, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
-        auto st = ggml_backend_graph_compute(target_backend(), proj_sg.gf);
-        if (st != GGML_STATUS_SUCCESS) {
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-        ggml_backend_tensor_get(proj_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
-        step_graph_destroy(proj_sg);
+        ggml_backend_tensor_set(logits_sg.hidden_input, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+        auto st = ggml_backend_graph_compute(target_backend(), logits_sg.gf);
+        if (st != GGML_STATUS_SUCCESS) return false;
+        ggml_backend_tensor_get(logits_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
         return true;
     };
 
