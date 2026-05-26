@@ -1406,9 +1406,10 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
         total_expert_bytes += layer_expert_bytes[(size_t)il] * (uint64_t)w.n_expert;
     }
 
-    // KV cache size estimate
+    // KV cache size estimate — use config max_ctx (from --max-ctx flag),
+    // env var DFLASH_MAX_CONTEXT as override, fallback to DevicePlacement default.
     const char * ctx_env = std::getenv("DFLASH_MAX_CONTEXT");
-    int max_context = ctx_env ? std::atoi(ctx_env) : 8192;
+    int max_context = ctx_env ? std::atoi(ctx_env) : cfg_.device.max_ctx;
     if (max_context <= 0) max_context = 8192;
 
     // KV cache: n_layer × 2 (K+V) × n_head_kv × head_dim × sizeof(fp16) × max_context
