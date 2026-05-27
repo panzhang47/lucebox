@@ -39,7 +39,7 @@ Each one is self-contained with setup instructions and benchmark notes.
 
 ---
 
-## Supported Models
+## Supported Foundation Models
 
 All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combined = geometric mean √(TTFT × decode) where both phases benched; otherwise the single-phase speedup.
 
@@ -53,25 +53,25 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Qwen 3.5-27B Q4_K_M (DFlash + PFlash, HIP) | **~2.6×** |
 | Gemma-4-26B-A4B Q4_K_M (DFlash) | **1.31×** |
 
-## Supported Machines
+## Tested Machines (GPU/APU)
 
 Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NVIDIA archs auto-detected by CMake / `setup.py`; AMD HIP backend separate ([Strix Halo section](#amd-strix-halo-hip-backend)).
 
 | | Arch | GPU | Min CUDA / ROCm | Status | Bench |
 |:---:|------|-----|:---------------:|--------|:-----:|
-| <img src="assets/gpus/3090.png" width="80" /> | Ampere `sm_86` | RTX 3090, A-series | CUDA 12.0 | ✅ reference | [megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) · [dflash](server/RESULTS.md) |
-| <img src="assets/gpus/5090.png" width="80" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8 | ✅ 205 tok/s, 4.84× | [↗](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
-| <img src="assets/gpus/gb10.png" width="80" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | ✅ megakernel NVFP4 | [↗](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
-| <img src="assets/gpus/2080ti.png" width="80" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | ✅ 53 tok/s DFlash | [↗](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
-| <img src="assets/gpus/4090.png" width="80" /> | Ada `sm_89` | RTX 40xx | CUDA 12.0 | 🟡 community WSL2 bench | [↗](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
+| <img src="assets/gpus/3090.png" width="140" /> | Ampere `sm_86` | RTX 3090, A-series | CUDA 12.0 | ✅ reference | [megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) · [dflash](server/RESULTS.md) |
+| <img src="assets/gpus/5090.png" width="140" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8 | ✅ 205 tok/s, 4.84× | [↗](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
+| <img src="assets/gpus/gb10.png" width="140" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | ✅ megakernel NVFP4 | [↗](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
+| <img src="assets/gpus/2080ti.png" width="140" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | ✅ 53 tok/s DFlash | [↗](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
+| <img src="assets/gpus/4090.png" width="140" /> | Ada `sm_89` | RTX 40xx | CUDA 12.0 | 🟡 community WSL2 bench | [↗](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
 | — | Blackwell `sm_110` | Jetson AGX Thor | CUDA 13.0 | 🟡 builds, unbenched | — |
-| <img src="assets/gpus/v100.png" width="80" /> | Volta `sm_70` / Pascal `sm_61` | V100, P40 | CUDA 12.0 | 🟡 fallback paths, unbenched | — |
-| <img src="assets/gpus/ryze395.png" width="80" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](#amd-strix-halo-hip-backend) |
-| <img src="assets/gpus/7900xtx.png" width="80" /> | RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/docs/HIP_PERF_PLAN.md) |
+| <img src="assets/gpus/v100.png" width="140" /> | Volta `sm_70` / Pascal `sm_61` | V100, P40 | CUDA 12.0 | 🟡 fallback paths, unbenched | — |
+| <img src="assets/gpus/ryze395.png" width="140" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](#amd-strix-halo-hip-backend) |
+| <img src="assets/gpus/7900xtx.png" width="140" /> | RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/docs/HIP_PERF_PLAN.md) |
 
-Build needs CMake 3.18+, PyTorch 2.0+, `--recurse-submodules` for `Luce-Org/llama.cpp@luce-dflash`. Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
+`server/` (DFlash) builds with CMake 3.18+ and `--recurse-submodules` for `Luce-Org/llama.cpp@luce-dflash` — no PyTorch needed. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
-## Supported Harnesses
+## Quick Start On Harnesses
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
 for Lucebox server compatibility. Run Lucebox inside Claude Code, Codex,
