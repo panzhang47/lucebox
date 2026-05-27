@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="Lucebox" width="65%">
+  <img src="assets/banner.png" alt="Lucebox" width="85%">
 </p>
 
 <p align="center">
