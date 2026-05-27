@@ -18,14 +18,14 @@
 
 <p align="center">
   <strong>Local LLM inference server built for speed. Custom kernels, speculative prefill & decoding.</strong><br/>
-  Each optimization to our engine is for specific model family and hardware target.
+  Each optimization in our engine is for specific model family and hardware target.
 </p>
 
 ---
 
 ## Inference Engine Optimizations
 
-Each directory is self-contained with setup instructions and benchmark notes.
+Each one is self-contained with setup instructions and benchmark notes.
 
 <p align="center">
   <a href="optimizations/megakernel/"><img src="assets/cards/megakernel_card.png" alt="Megakernel" width="46%"></a>
@@ -39,9 +39,9 @@ Each directory is self-contained with setup instructions and benchmark notes.
 
 ---
 
-## Supported models
+## Supported Models
 
-All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combined = geometric mean √(TTFT × decode) where both phases benched; otherwise the single-phase speedup. GPU-specific numbers in the table below.
+All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combined = geometric mean √(TTFT × decode) where both phases benched; otherwise the single-phase speedup.
 
 | Model | Speedup |
 |-------|:-------:|
@@ -53,20 +53,28 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Qwen 3.5-27B Q4_K_M (DFlash + PFlash, HIP) | **~2.6×** |
 | Gemma-4-26B-A4B Q4_K_M (DFlash) | **1.31×** |
 
-## Client harnesses
+## Supported Harnesses
+
+<p align="center">
+  <a href="harness/"><img src="harness/assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="600" /></a>
+</p>
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
-for Lucebox server compatibility. Use it to run Lucebox inside Claude Code,
-Codex, OpenCode, Hermes, Pi, OpenClaw, or Open WebUI, or to check that a server
-change still works with those clients.
+for Lucebox server compatibility. Run Lucebox inside Claude Code, Codex,
+OpenCode, Hermes, Pi, OpenClaw, or Open WebUI, or check if a server change
+still works with those clients.
 
-```bash
-harness/clients/run_codex.sh
-harness/clients/run_claude_code.sh
-python3 harness/client_test_runner.py probe --url http://127.0.0.1:8000
-```
+| Client | Launcher |
+|--------|----------|
+| Claude Code | [`harness/clients/run_claude_code.sh`](harness/clients/run_claude_code.sh) |
+| Codex | [`harness/clients/run_codex.sh`](harness/clients/run_codex.sh) |
+| OpenCode | [`harness/clients/run_opencode.sh`](harness/clients/run_opencode.sh) |
+| Hermes | [`harness/clients/run_hermes.sh`](harness/clients/run_hermes.sh) |
+| Pi | [`harness/clients/run_pi.sh`](harness/clients/run_pi.sh) |
+| OpenClaw | [`harness/clients/run_openclaw.sh`](harness/clients/run_openclaw.sh) |
+| Open WebUI | [`harness/clients/run_openwebui.sh`](harness/clients/run_openwebui.sh) |
 
-The harness launches the native C++ HTTP server (`dflash_server`):
+All launchers spawn the native C++ HTTP server (`dflash_server`). Override defaults via env vars:
 
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
