@@ -359,6 +359,39 @@ DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
 
 **Requirements:** NVIDIA sm_60+ GPU (Pascal P40 24GB, V100 32GB, 2080 Ti, 3090, A10, A40, 4090) or Jetson AGX Thor sm_110, CUDA 12+ (CUDA 13+ required for Thor), 22+ GB VRAM, ~80 GB disk. Pascal GPUs use the scalar flashprefill fallback (no WMMA); P100 (12/16 GB) cannot fit the 27B target + draft under the 22 GB minimum. On Volta (SM 7.0) and Turing (SM 7.5), BF16 draft weights are auto-converted to FP16 at load time for tensor core acceleration.
 
+### Verify your target
+
+```bash
+python -c "import torch; p=torch.cuda.get_device_properties(0); print(p.name, 'sm_%d%d'%(p.major,p.minor), p.multi_processor_count,'SMs', round(p.total_memory/1e9,1),'GB')"
+nvcc --version
+```
+
+### DGX Spark / GB10 (sm_121, CUDA 12.9+)
+
+```bash
+nvcc --version  # must show >= 12.9
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds sm_121
+cmake --build build --target test_dflash dflash_server -j
+```
+
+On GB10 (128 GB unified), re-sweep `--ddtree-budget` (larger tree = more verify throughput until memory bandwidth saturates) and consider skipping KV quantization entirely (`--cache-type-k f16 --cache-type-v f16`).
+
+### Jetson AGX Thor (sm_110, CUDA 13.0+)
+
+```bash
+nvcc --version  # must show >= 13.0
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds Thor arch
+cmake --build build --target test_dflash dflash_server -j
+```
+
+### Per-GPU retune
+
+- **DDTree `--ddtree-budget`**: 22 on 3090 + Q4_K_M + 24 GB (default). RTX 5090 = 40 (swept). GB10 = re-sweep.
+- **TQ3_0 KV** sized for 24 GB. On 32 GB (5090) or 128 GB (GB10) you can push context further or skip quantization.
+- Headline numbers (207 tok/s demo, 129.5 HumanEval, 2.8× vs SGLang AWQ) are RTX 3090 stock. RTX 5090 numbers (205 tok/s HE, 4.84×) are in [RESULTS.md](RESULTS.md). Ada / GB10 / Thor not yet swept, PRs welcome.
+
 ## AMD HIP backend (Strix Halo, RX 7900 XTX)
 
 Same DFlash + PFlash stack on AMD GPUs. PR #119 ports the Phase 2 rocWMMA flashprefill kernels to HIP. End-to-end on a Ryzen AI MAX+ 395 box (Radeon 8060S iGPU, `gfx1151`, 128 GiB LPDDR5X-8000 unified): **37.0 tok/s DFlash decode** on Qwen3.5-27B Q4_K_M, **27.6 s TTFT @ 16K** with NIAH retrieval intact. **3.08× decode and 2.24× prefill over llama.cpp HIP AR** on the same iGPU. End-to-end wall clock at a 16K prompt + 1K generation workload: **2.66× faster** than vanilla llama.cpp.
