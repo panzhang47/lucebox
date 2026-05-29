@@ -270,8 +270,6 @@ Local AI should be the default, not a privilege. Private data, no per-token bill
 
 Nothing was built for local AI inference. Most machines bolt a stock GPU onto a desktop CPU and run a stock runtime, never tuning the kernels to the silicon underneath. On the same 27B model, a DGX Spark or Mac Studio leaves four to six times the real throughput on the table. General-purpose frameworks won the last decade because hand-tuning per chip cost more than it returned: one stack, decent on everything, great on nothing. Speculative decoding, speculative prefill, and fused megakernels turn idle silicon into 3-10× speedups, but they stay locked to BF16 weights on data-center GPUs. Consumer cards inherit the leftovers.
 
-AI-assisted development flips that calculus. Lucebox ports those speculative methods down to quantized GGUF on consumer cards, one chip and one model family at a time. Apache 2.0 source, full writeups, reproducible benchmarks.
-
 **See the benchmarks and the machine at [lucebox.com](https://lucebox.com).**
 
 <p align="center">
