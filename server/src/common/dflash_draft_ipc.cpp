@@ -66,9 +66,13 @@ size_t draft_ipc_shared_bytes_from_env(size_t required_bytes) {
     if (!raw || !*raw) {
         return required_bytes;
     }
+    if (raw[0] == '-') {
+        return required_bytes;
+    }
     char * end = nullptr;
     const unsigned long long parsed = std::strtoull(raw, &end, 10);
-    if (end == raw || *end != '\0') {
+    if (end == raw || *end != '\0' ||
+        parsed > (unsigned long long)std::numeric_limits<size_t>::max()) {
         return required_bytes;
     }
     return std::max((size_t)parsed, required_bytes);

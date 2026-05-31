@@ -346,6 +346,12 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 }
                 continue;
             }
+            if (cmd == "reset_request_state") {
+                for (auto & shard : shards) reset_target_cache(shard.cache);
+                prefill_last_logits.clear();
+                stream_status(stream_fd, 0);
+                continue;
+            }
             if (cmd == "project_pipe") {
                 int project_tokens = 0;
                 size_t project_bytes = 0;

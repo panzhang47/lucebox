@@ -60,10 +60,12 @@ bool Qwen35LayerSplitDFlashTarget::snapshot_kv() {
 }
 
 bool Qwen35LayerSplitDFlashTarget::restore_kv() {
-    for (auto & shard : shards_) restore_ssm_state(shard.cache);
     if (remote_target_shard_ && remote_target_shard_->active()) {
-        return remote_target_shard_->restore_kv();
+        if (!remote_target_shard_->restore_kv()) {
+            return false;
+        }
     }
+    for (auto & shard : shards_) restore_ssm_state(shard.cache);
     return true;
 }
 

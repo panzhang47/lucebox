@@ -289,6 +289,11 @@ void Qwen35LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 
 void Qwen35LayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) reset_target_cache(shard.cache);
+    if (use_mixed_target_split() &&
+        !remote_target_shard_.reset_request_state()) {
+        std::fprintf(stderr,
+            "[target-split] remote shard reset_request_state failed\n");
+    }
     prefill_last_logits_.clear();
 }
 

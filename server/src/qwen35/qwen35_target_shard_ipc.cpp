@@ -57,9 +57,13 @@ size_t target_shard_shared_bytes_from_env(size_t required_bytes) {
     if (!raw || !*raw) {
         return required_bytes;
     }
+    if (raw[0] == '-') {
+        return required_bytes;
+    }
     char * end = nullptr;
     const unsigned long long parsed = std::strtoull(raw, &end, 10);
-    if (end == raw || *end != '\0') {
+    if (end == raw || *end != '\0' ||
+        parsed > (unsigned long long)std::numeric_limits<size_t>::max()) {
         return required_bytes;
     }
     return std::max((size_t)parsed, required_bytes);
@@ -348,6 +352,20 @@ bool Qwen35TargetShardIpcClient::restore_kv() {
     const int stream_fd = process_.stream_fd();
     if (!active_ || !cmd || stream_fd < 0) return false;
     std::fprintf(cmd, "restore\n");
+    std::fflush(cmd);
+    int32_t status = -1;
+    return read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+#endif
+}
+
+bool Qwen35TargetShardIpcClient::reset_request_state() {
+#if defined(_WIN32)
+    return false;
+#else
+    FILE * cmd = process_.command_stream();
+    const int stream_fd = process_.stream_fd();
+    if (!active_ || !cmd || stream_fd < 0) return false;
+    std::fprintf(cmd, "reset_request_state\n");
     std::fflush(cmd);
     int32_t status = -1;
     return read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;

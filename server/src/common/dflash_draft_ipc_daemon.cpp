@@ -451,7 +451,7 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                 std::fprintf(stderr, "[draft-ipc-daemon] bad propose_pipe: %s\n",
                              line.c_str());
                 stream_status(stream_fd, -1);
-                break;
+                continue;
             }
             if (!read_exact_fd(payload_fd, noise_embed.data(), bytes)) {
                 std::fprintf(stderr, "[draft-ipc-daemon] read noise pipe failed\n");
