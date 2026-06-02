@@ -1426,6 +1426,12 @@ void HttpServer::worker_loop() {
                 tokenizer_.encode(build_stall_tool_prefix(req.tools,
                                                           req.tool_choice));
             stall_action_suffix_tokens_storage = tokenizer_.encode(":");
+            // The stall detector only asks "did the model just end on an action
+            // suffix?" by matching individual recent tokens (tokens_have_recent_any),
+            // so we collect the trailing token of each colon variant rather than the
+            // full encoded sequence. The final ":" piece is what actually precedes the
+            // premature EOS regardless of how the preamble before it tokenizes, so a
+            // flat set of these terminal tokens is the right granularity here.
             auto add_suffix_terminal = [&](const std::string & text) {
                 auto ids = tokenizer_.encode(text);
                 if (ids.empty()) return;

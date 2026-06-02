@@ -1084,6 +1084,11 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                     if (logits_buf[v] > altbest) { altbest = logits_buf[v]; alt = v; }
                 }
                 if (alt >= 0) {
+                    // Debug-only diagnostic: writes happen exclusively when the
+                    // operator opts into DFLASH_MIN_TOKENS, so the default
+                    // production lane never touches /tmp/dflash_floor.log. When
+                    // enabled for a debugging session, treat it as append-only
+                    // and rotate/clear out of band.
                     FILE* _d = std::fopen("/tmp/dflash_floor.log", "a");
                     if (_d) { std::fprintf(_d, "[floor] eos@%d -> alt=%d\n", (int)out_tokens.size(), alt); std::fclose(_d); }
                     next_tok = alt;
@@ -1248,10 +1253,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     }
 
     out_spec_ran = true;
-    static const int _min_floor = []{
-        const char* e = std::getenv("DFLASH_MIN_TOKENS");
-        return e ? std::atoi(e) : 0;
-    }();
+    static const int _min_floor = env_int_or_default("DFLASH_MIN_TOKENS", 0);
 
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
@@ -1512,6 +1514,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                                      *stall_skip_tokens,
                                                      kSkipSequenceLookback));
                 if (can_inject_tool) {
+                    // Debug-only diagnostic, same DFLASH_MIN_TOKENS gating as the
+                    // AR-path floor log above; silent in the default lane.
                     FILE* _d = std::fopen("/tmp/dflash_floor.log", "a");
                     if (_d) {
                         std::fprintf(_d,
@@ -1568,6 +1572,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 cache_.cur_pos = committed;
             }
         } else {
+            // Normal (non-floor) path: carry the replay's last token into the
+            // next draft step. The floor_to_ar path never reaches the next
+            // iteration — it sets cache_.last_tok directly below and returns —
+            // so last_tok is intentionally left untouched when flooring.
             last_tok = replay_last_tok;
             committed += emitted;
         }
