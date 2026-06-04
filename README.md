@@ -191,7 +191,8 @@ DFLASH27B_KV_TQ3=1 \
 | `--ddtree` | off (chain) | Enable tree verify |
 | `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
 | `--fa-window N` | `2048` | Sliding FA window; `0` = full attention |
-| `--lazy-draft` | off | Defer draft load until first request |
+| `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
+| `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
 
 **Prefill compression (PFlash)**
 
@@ -200,6 +201,7 @@ DFLASH27B_KV_TQ3=1 \
 | `--prefill-compression {off,auto,always}` | `off` | When to score+compress the prompt |
 | `--prefill-threshold N` | `32000` | Token threshold for `auto` |
 | `--prefill-keep-ratio F` | `0.05` | Fraction of source tokens kept (0.02 @128K, 0.10 @32K) |
+| `--prefill-curve T:R [T:R ...]` | off (flat keep-ratio) | Piecewise keep-ratio curve, linear-interpolated over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression @10K, 5× @40K, 10× @100K+). Overrides `--prefill-keep-ratio`; per-session bandit override still wins. |
 | `--prefill-drafter <gguf>` | required if on | Drafter weights (Qwen3-0.6B BF16 GGUF) |
 | `--prefill-skip-park` | off | Keep drafter resident across requests (more VRAM, faster) |
 | `DFLASH_FP_USE_BSA=1` | `0` | Dispatch sparse FA through BSA (sm_80+); required for headline 10.4× |

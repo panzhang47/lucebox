@@ -411,8 +411,9 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
                      req.input_ids.size(), result.compressed_ids.size());
     }
 
-    // Keep drafter loaded (own backend + weights persist), matching test_dflash.
-    // ~1.4 GB stays resident but avoids reload cost on subsequent compresses.
+    if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+        free_drafter();
+    }
 
     // Restore park state
     if (!req.skip_park) {
@@ -1018,18 +1019,37 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             return false;
         }
 
+        // Fill kv_write_rows with this step's cache slot (committed) for set_rows.
+        if (sg_.kv_write_rows) {
+            const int n_head_kv = w_.n_head_kv;
+            std::vector<int64_t> row_vals(n_head_kv, (int64_t)committed);
+            ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
+                                    sizeof(int64_t) * n_head_kv);
+        }
+
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
 
         after_target_compute(sg_, committed, 1);
 
-        ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
-                                sizeof(float) * vocab);
+        // GPU argmax: read 4 bytes, skip the 970 KB logit D2H. Escape: DFLASH_GPU_ARGMAX=0.
+        static const bool kGpuArgmaxAR = []() {
+            const char * v = std::getenv("DFLASH_GPU_ARGMAX");
+            return v == nullptr || v[0] != '0';
+        }();
         int32_t next_tok;
         if (sampler_.needs_logit_processing()) {
+            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                    sizeof(float) * vocab);
             next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
                                       out_tokens, sampler_rng_);
+        } else if (kGpuArgmaxAR && sg_.argmax_tokens) {
+            int32_t tok_i = 0;
+            ggml_backend_tensor_get(sg_.argmax_tokens, &tok_i, 0, sizeof(int32_t));
+            next_tok = tok_i;
         } else {
+            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                    sizeof(float) * vocab);
             next_tok = 0;
             float best = logits_buf[0];
             for (int j = 1; j < vocab; j++) {

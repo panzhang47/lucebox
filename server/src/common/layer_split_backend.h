@@ -25,11 +25,13 @@ public:
 
     virtual void begin_request(const GenerateRequest & req) { (void)req; }
     virtual void reset_request_state() = 0;
+    virtual int prefill_chunk_tokens() const { return 0; }
     virtual bool prefill(const std::vector<int32_t> & prompt,
                          int base_pos, int & last_tok) = 0;
     virtual bool decode_ar(int last_tok, int committed, int n_gen,
                            std::vector<int32_t> & out_tokens,
                            const DaemonIO & io) = 0;
+    virtual bool supports_cpu_sampling() const { return false; }
 
     virtual bool can_dflash_decode() const { return false; }
     virtual bool decode_dflash(const std::vector<int32_t> & prompt,

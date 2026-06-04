@@ -31,6 +31,7 @@ struct Qwen35LayerSplitAdapterConfig {
     int fa_window = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     int kq_stride_pad = 32;
     int draft_ctx_max = 4096;
+    int chunk = 512;
     int max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
     bool run_dflash = false;
     int draft_swa_window = 0;
@@ -50,11 +51,13 @@ public:
 
     void begin_request(const GenerateRequest & req) override;
     void reset_request_state() override;
+    int prefill_chunk_tokens() const override;
     bool prefill(const std::vector<int32_t> & prompt,
                  int base_pos, int & last_tok) override;
     bool decode_ar(int last_tok, int committed, int n_gen,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override;
+    bool supports_cpu_sampling() const override { return true; }
 
     bool can_dflash_decode() const override;
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
@@ -99,6 +102,7 @@ private:
     bool pflash_drafter_loaded_ = false;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     std::vector<std::vector<PrefixSnapshot>> prefix_snapshots_;
+    std::vector<std::vector<float>> snapshot_prefill_logits_;
     std::vector<ggml_backend_t> snapshot_backends_;
     struct DraftFeatureSnapshot {
         int cur_pos = 0;
@@ -114,6 +118,7 @@ private:
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};
     std::unique_ptr<DFlashTarget> dflash_target_;
+    std::vector<float> prefill_last_logits_;
 };
 
 }  // namespace dflash::common

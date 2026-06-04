@@ -57,7 +57,8 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
         result.error = "context";
         return result;
     }
-    if (req.do_sample && req.sampler.temp > 0.0f) {
+    if (req.do_sample && req.sampler.needs_logit_processing() &&
+        !adapter_->supports_cpu_sampling()) {
         result.error = "sampling_unsupported";
         return result;
     }
@@ -66,6 +67,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     if (reset_state) adapter_->reset_request_state();
 
     const int prompt_len = (int)req.prompt.size();
+    const int adapter_chunk = adapter_->prefill_chunk_tokens();
     int last_tok = (base_pos > 0 && prompt_len == 0)
         ? adapter_->current_last_token()
         : -1;
@@ -73,6 +75,9 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     auto t_prefill_start = std::chrono::steady_clock::now();
     while (consumed < prompt_len) {
         int n_tokens = prompt_len - consumed;
+        if (adapter_chunk > 0 && n_tokens > adapter_chunk) {
+            n_tokens = adapter_chunk;
+        }
         if (req.snap_pos >= 0 && req.snap_slot >= 0 &&
             req.snap_pos > base_pos + consumed &&
             req.snap_pos < base_pos + consumed + n_tokens) {
