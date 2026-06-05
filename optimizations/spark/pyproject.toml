@@ -1,0 +1,38 @@
+[project]
+name = "spark"
+version = "0.1.0"
+description = "Calibration + validation tooling for Luce Spark hot/cold expert residency"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "lucebox"}]
+license = {text = "Apache-2.0"}
+keywords = ["llm", "mixture-of-experts", "offloading", "sparsity", "moe", "laguna"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# The hot/cold offload engine + bounded expert cache live in ../../server/ (C++/
+# CUDA). This package only drives the daemon: extract a corpus, tokenize, run
+# calibration, validate. `gguf`/`torch` are optional (tokenizer extraction and
+# the research pre-gate trainer).
+dependencies = [
+    "tokenizers>=0.15",
+]
+
+[project.optional-dependencies]
+tokenizer = ["gguf>=0.10", "numpy"]
+pregate = ["torch", "numpy"]
+
+[project.urls]
+Homepage = "https://github.com/Luce-Org/lucebox-hub"
+Source = "https://github.com/Luce-Org/lucebox-hub/tree/main/optimizations/spark"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spark*"]
