@@ -154,19 +154,26 @@ jobs:
         # safe and fast in CI. This is the execution the hosted jobs cannot do.
         run: ./server/build/test_flash_attn_sparse
 
-      # Optional model-backed end-to-end smoke, disabled by default: it needs
-      # the 16 GB Qwen3.6-27B GGUF + draft staged on the runner. To enable,
-      # stage the weights on lucebox3, set repo variable LUCEBOX_MODELS_DIR, and
-      # uncomment. Mark continue-on-error so a heavy/flaky run never blocks PRs.
+      # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
+      # disabled by default because it builds dflash_server and lazy-loads the
+      # ~16 GB Qwen3.6-27B target + draft (~1-2 min). The weights are already
+      # staged at /opt/models on lucebox3 (override with repo var
+      # LUCEBOX_MODELS_DIR). Verified working on the runner. To enable, uncomment;
+      # continue-on-error keeps a heavy/slow run from ever blocking a PR.
       # - name: dflash end-to-end smoke (model-backed)
       #   continue-on-error: true
+      #   env:
+      #     MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
       #   run: |
       #     cd server
-      #     cmake --build build --target test_dflash -j"$(nproc)"
-      #     ./build/test_dflash \
-      #       "${{ vars.LUCEBOX_MODELS_DIR }}/Qwen3.6-27B-Q4_K_M.gguf" \
-      #       "${{ vars.LUCEBOX_MODELS_DIR }}/draft" \
-      #       test/prompt_ids.bin
+      #     cmake --build build --target dflash_server -j"$(nproc)"
+      #     ./build/dflash_server "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
+      #       --draft "$MODELS/draft/dflash-draft-3.6-q4_k_m.gguf" --port 8099 &
+      #     SRV=$!; trap 'kill $SRV 2>/dev/null' EXIT
+      #     for i in $(seq 1 90); do curl -sf localhost:8099/v1/models >/dev/null && break; sleep 2; done
+      #     curl -sf --max-time 240 localhost:8099/v1/completions \
+      #       -H 'Content-Type: application/json' \
+      #       -d '{"prompt":"The capital of France is","max_tokens":8}' | grep -q '"text"'
 
   gpu-tests-amd:
     name: GPU tests (self-hosted Radeon 8060S, gfx1151 / ROCm)
