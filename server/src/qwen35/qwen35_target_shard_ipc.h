@@ -55,6 +55,7 @@ public:
 
     bool snapshot_kv();
     bool restore_kv();
+    bool reset_request_state();
     bool snapshot_save(int slot);
     void snapshot_free(int slot);
     bool snapshot_restore(int slot);

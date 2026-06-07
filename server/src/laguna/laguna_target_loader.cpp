@@ -60,6 +60,9 @@
 
 namespace dflash::common {
 
+// fwd-decl: defined below at file scope, used by should_load_laguna_tensor
+static bool is_laguna_expert_tensor(const char * name);
+
 namespace {
 
 // Same Mmap shape as gguf_target_loader.cpp's local helper. Duplicated locally
@@ -157,6 +160,7 @@ bool should_load_laguna_tensor(const char * name, const TargetLoadPlan & plan) {
         std::strcmp(name, "output.weight") == 0) {
         return plan.load_output;
     }
+    if (plan.skip_expert_tensors && is_laguna_expert_tensor(name)) return false;
     int layer_id = -1;
     if (parse_block_tensor_name(name, layer_id)) {
         return layer_id >= plan.layer_begin && layer_id < plan.layer_end;
@@ -574,4 +578,18 @@ void free_laguna_target_weights(LagunaTargetWeights & w) {
     w.output   = nullptr;
 }
 
+// ── Partial loader (hybrid mode) ────────────────────────────────────────
+//
+// Loads laguna GGUF but skips uploading expert tensor DATA to GPU.
+// Tensor metadata (shapes, offsets) is still parsed so that the hybrid
+// storage builder can use ggml_nbytes() to compute per-expert sizes.
+// Expert data will be loaded via mmap into the hot/cold split buffers.
+
+static bool is_laguna_expert_tensor(const char * name) {
+    // Expert tensors are: ffn_gate_exps, ffn_up_exps, ffn_down_exps
+    // (per-layer, named blk.<N>.ffn_{gate,up,down}_exps.weight)
+    return std::strstr(name, "ffn_gate_exps") != nullptr ||
+           std::strstr(name, "ffn_up_exps") != nullptr ||
+           std::strstr(name, "ffn_down_exps") != nullptr;
+}
 } // namespace dflash::common

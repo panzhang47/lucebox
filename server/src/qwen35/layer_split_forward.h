@@ -60,7 +60,8 @@ bool run_qwen35_layer_split_forward(
         DraftFeatureMirror * feature_ring = nullptr,
         std::vector<int32_t> * argmax_out = nullptr,
         std::vector<float> * logits_out = nullptr,
-        DFlashDraftIpcClient * remote_draft = nullptr);
+        DFlashDraftIpcClient * remote_draft = nullptr,
+        ggml_type activation_type = GGML_TYPE_F32);
 
 bool run_qwen35_layer_split_forward_from_activation(
         std::vector<Qwen35LayerSplitShard> & shards,

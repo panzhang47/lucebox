@@ -47,6 +47,7 @@ public:
 
     void begin_request(const GenerateRequest & req) override;
     void reset_request_state() override;
+    int prefill_chunk_tokens() const override { return cfg_.chunk > 0 ? cfg_.chunk : 0; }
     bool prefill(const std::vector<int32_t> & prompt,
                  int base_pos, int & last_tok) override;
     bool decode_ar(int last_tok, int committed, int n_gen,
@@ -74,6 +75,7 @@ private:
     std::vector<Gemma4LayerSplitShard> shards_;
     std::vector<ggml_backend_t> snapshot_backends_;
     std::vector<Gemma4LayerSplitSnapshot> snapshots_;
+    ggml_type activation_type_ = GGML_TYPE_F32;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};

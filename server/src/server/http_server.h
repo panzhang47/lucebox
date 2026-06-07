@@ -18,10 +18,12 @@
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "api_types.h"
+#include "placement/draft_residency.h"
 #include "placement/remote_draft_config.h"
 #include "common/pflash_drafter_ipc.h"
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
+#include "server_status.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -149,7 +151,15 @@ struct ServerConfig {
     bool        pflash_remote_drafter = false; // use IPC drafter for mixed backends
     RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
     bool        pflash_skip_park = false;   // skip park/unpark for >=32GB GPUs
-    bool        lazy_draft      = false;   // park decode draft when idle to save VRAM
+    // Passthrough proxy — forward to upstream OpenAI-compatible server
+    std::string pflash_upstream_base;      // e.g. "http://localhost:8080/v1"
+    std::string pflash_upstream_key;       // Bearer token for upstream
+    std::string pflash_upstream_model;     // model name in forwarded requests
+    // Piecewise keep-ratio curve: (token_threshold, keep_ratio) sorted ascending.
+    // If empty, uses pflash_keep_ratio as flat value.
+    std::vector<std::pair<int, float>> pflash_curve;
+    bool        lazy_draft      = false;   // legacy alias for request-scoped draft residency
+    DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
@@ -180,6 +190,8 @@ struct ParsedRequest {
     json                      tool_choice;
     // Original messages (for response formatting)
     json                      messages;
+    // Original request body (for upstream proxy forwarding)
+    json                      raw_body;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -286,6 +298,26 @@ private:
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;
+
+    // Live status tracker (read by /status/json, written by worker thread).
+    ServerStatus status_;
+
+    // SSE client connections for /status/events push.
+    std::mutex             sse_mu_;
+    std::vector<int>       sse_fds_;
+
+    // Broadcast current status to all SSE clients. Removes dead fds.
+    void broadcast_status();
+
+    // Broadcast incremental token text to SSE clients.
+    void broadcast_token(const std::string & text);
+
+    // Send SSE heartbeat comment to prune disconnected clients.
+    void sse_heartbeat();
+
+    // Resolve and cache path to share/status.html.
+    std::string status_html_path_;
+    std::string resolve_status_html();
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;

@@ -17,12 +17,14 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
 #include "placement/placement_config.h"
 #include "common/layer_split_backend.h"
 #include "common/layer_split_utils.h"
+#include "placement/draft_residency.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -316,6 +318,343 @@ static void test_parse_tool_allowed_filter() {
     // Tool not in allow-list should be filtered
     TEST_ASSERT(result.tool_calls.empty());
 }
+
+// ─── Pattern 5: call:<verb>{...} plain-text tool calls ─────────────────
+//
+// Covers the gemma plain-text emission path added in
+// server/src/server/tool_parser.cpp (PR #340). The opener regex requires
+// a sentinel character before `call:` (start-of-string or one of
+// [\s,;:\(\[\{\}\)\]\>_]); the body is brace-balanced and string-aware;
+// and the args go through coerce_relaxed_json before becoming the
+// argument object.
+
+static void test_parse_call_verb_empty_args() {
+    // Bareword `call:get_weather{}` at start-of-string — sentinel
+    // matches the leading `^` anchor; body is the empty object `{}`.
+    auto result = parse_tool_calls("call:get_weather{}");
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args.is_object());
+        TEST_ASSERT(args.empty());
+    }
+    // The matched span should be removed from cleaned_text.
+    TEST_ASSERT(result.cleaned_text.find("call:get_weather") == std::string::npos);
+}
+
+static void test_parse_call_verb_strict_json_args() {
+    // Strict JSON args go through json::parse directly in
+    // coerce_relaxed_json's fast path.
+    auto result = parse_tool_calls("call:get_weather{\"city\": \"NYC\"}");
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["city"] == "NYC");
+    }
+}
+
+static void test_parse_call_verb_namespaced_verb() {
+    // `ns:foo` namespaced verbs — the colon-strip logic in pattern 5
+    // strips everything up to the last `:` so the registered tool name
+    // is just `foo`.
+    auto result = parse_tool_calls("call:ns:foo{\"k\": 1}");
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "foo");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["k"] == 1);
+    }
+}
+
+static void test_parse_call_verb_whitespace_before_key() {
+    // Leading whitespace inside the brace body must not break parsing.
+    // (Whitespace tolerance is provided by json::parse / the relaxed
+    //  fallback rewriter.)
+    auto result = parse_tool_calls("call:get_weather{ \"city\": \"NYC\" }");
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["city"] == "NYC");
+    }
+}
+
+static void test_parse_call_verb_missing_close_brace_rejected() {
+    // Unbalanced opener — balanced_braces_end returns npos so pattern 5
+    // bails out and produces no tool call. The text leaks through.
+    auto result = parse_tool_calls("call:get_weather{\"city\": \"NYC\"");
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_narrative_without_body_rejected() {
+    // Narrative usage with a non-balanced body — sentinel matches the
+    // space before `call:`, but the `{` has no matching `}` so the
+    // call is discarded.
+    auto result = parse_tool_calls("I will call:foo{");
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_underscore_prefix() {
+    // SentencePiece artifact: `_call:` (the `_` is the literal
+    // underscore character; sentinel char-class includes `_` for
+    // exactly this case).
+    auto result = parse_tool_calls("_call:get_weather{\"city\": \"NYC\"}");
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["city"] == "NYC");
+    }
+}
+
+static void test_parse_call_verb_nested_object_args() {
+    // Nested `{}` inside the args — balanced_braces_end tracks depth so
+    // the outer close isn't consumed by the inner object.
+    auto result = parse_tool_calls(
+        "call:get_weather{\"loc\": {\"city\": \"NYC\", \"zip\": \"10001\"}}");
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["loc"].is_object());
+        TEST_ASSERT(args["loc"]["city"] == "NYC");
+        TEST_ASSERT(args["loc"]["zip"] == "10001");
+    }
+}
+
+static void test_parse_call_verb_back_to_back() {
+    // Gemma frequently emits multiple invocations back-to-back. The
+    // sentinel char-class includes `}` so the second `call:` is found
+    // after the first closes.
+    auto result = parse_tool_calls(
+        "call:a{\"x\": 1}call:b{\"y\": 2}");
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "a");
+        auto args0 = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args0["x"] == 1);
+        TEST_ASSERT(result.tool_calls[1].name == "b");
+        auto args1 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(args1["y"] == 2);
+    }
+}
+
+static void test_parse_call_verb_relaxed_single_quotes() {
+    // Relaxed-JSON fallback: single-quoted strings + bare identifier
+    // keys are rewritten to strict JSON before parse.
+    auto result = parse_tool_calls("call:foo{city: 'NYC'}");
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "foo");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["city"] == "NYC");
+    }
+}
+
+static void test_parse_call_verb_glued_to_word_rejected() {
+    // No sentinel char before `call:` (glued to identifier) — pattern 5
+    // must NOT match. `_` is a deliberate exception covered by its
+    // own test; here we use a regular letter.
+    auto result = parse_tool_calls("xcall:foo{\"a\": 1}");
+    // Pattern 5 should NOT fire. Pattern 6 (bare-JSON sweep) sees
+    // `{"a": 1}` but it has no `name`/`function` field, so it produces
+    // no tool call either.
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_does_not_hijack_inner_name() {
+    // Regression: pattern 5 must run before pattern 6 so that an inner
+    // {"name": "...", "arguments": {}} in the call's args doesn't get
+    // hijacked into a spurious bare-JSON tool call.
+    auto result = parse_tool_calls(
+        "call:outer{\"name\": \"inner\", \"arguments\": {}}");
+    // Should match exactly one tool: the outer call. The inner
+    // {"name":..., "arguments":...} JSON is shadowed by the recorded
+    // removal span.
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "outer");
+    }
+}
+
+// ─── Pattern 5 (cont.): PR #341 imports — narrative & quoting edge cases ─
+//
+// These tests originated in PR #341 alongside sse_emitter Pattern-B work
+// and were relocated here when #341 was split. They focus on edge cases
+// that complement the core call:<verb>{} suite above.
+
+static void test_parse_call_verb_single() {
+    std::string text = "call:get_country_info{country: \"France\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_country_info");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["country"] == "France");
+    }
+    TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
+}
+
+static void test_parse_call_verb_namespaced() {
+    std::string text = "call:execute-bead:read-file{path: \"crates/foo/src/lib.rs\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        // Verb only — namespace stripped.
+        TEST_ASSERT(result.tool_calls[0].name == "read-file");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "crates/foo/src/lib.rs");
+    }
+}
+
+static void test_parse_call_verb_snake_and_hyphen() {
+    std::string text =
+        "call:execute-bead:list-files{path: \"src/\"}\n\n"
+        "call:execute-bead:read_file{path: \"a/b.rs\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "list-files");
+        TEST_ASSERT(result.tool_calls[1].name == "read_file");
+    }
+}
+
+static void test_parse_call_verb_tool_allowed_filter() {
+    std::string text = "call:disallowed_verb{x: 1}call:allowed_verb{y: 2}";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "allowed_verb"}}}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "allowed_verb");
+    }
+}
+
+static void test_parse_call_verb_inline_prose_rejected() {
+    // No sentinel char before `call:` — must NOT match.
+    std::string text = "narrative.call:foo{x:1}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_inline_prose_after_space() {
+    // Whitespace IS a valid sentinel — this should match.
+    std::string text = "Sure, I'll call:foo{x: 1}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "foo");
+    }
+}
+
+static void test_parse_call_verb_malformed_args() {
+    // Unterminated brace — drop the call, don't crash.
+    std::string text = "call:foo{country: \"France\"";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_inner_brace_in_string() {
+    // The `{` and `}` inside the string value must not confuse the
+    // balanced-brace scanner.
+    std::string text = "call:foo{cmd: \"echo {not_a_brace} ok\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["cmd"] == "echo {not_a_brace} ok");
+    }
+}
+
+static void test_parse_call_verb_unquoted_keys() {
+    // Relaxed-JSON path: bare keys get quoted.
+    std::string text = "call:foo{path: \"x\", count: 3}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "x");
+        TEST_ASSERT(args["count"] == 3);
+    }
+}
+
+static void test_parse_call_verb_cleaned_text() {
+    // The matched span should be stripped from cleaned_text.
+    std::string text = "Hello call:foo{x: 1} world.";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("Hello") != std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("world.") != std::string::npos);
+}
+
+static void test_parse_call_verb_intercept_inner_json() {
+    // Codex-requested: inner args of the form {"name": ..., "arguments": ...}
+    // must NOT be picked up by pattern 6 (bare-JSON sweep) as a spurious
+    // `inner` ToolCall. Exactly one ToolCall, named `outer`, with the
+    // inner JSON intact in its arguments.
+    std::string text = "call:outer{\"name\": \"inner\", \"arguments\": {}}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "outer");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["name"] == "inner");
+        TEST_ASSERT(args["arguments"].is_object());
+    }
+}
+
+static void test_parse_call_verb_multiline_args() {
+    // Snapshot rows have multi-line nested args; the balanced-brace
+    // scanner is line-agnostic, so this must Just Work.
+    std::string text =
+        "call:default_api:analyze_data{\n"
+        "  data: [{\"date\": \"2024-10-05\", \"qty\": 50}, {\"date\": \"2024-10-06\", \"qty\": 60}],\n"
+        "  metric: \"qty\"\n"
+        "}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "analyze_data");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["metric"] == "qty");
+        TEST_ASSERT(args["data"].is_array());
+        TEST_ASSERT(args["data"].size() == 2);
+    }
+}
+
+
+static void test_parse_call_verb_singlequote_with_inner_doublequote() {
+    // Cubic PR #329 review: when the relaxed-JSON rewrite converts
+    // single-quoted strings to double-quoted, inner `"` chars must be
+    // escaped to `\"` — otherwise `'he said "hi"'` rewrites to
+    // `"he said "hi""` which is invalid JSON and the whole tool call
+    // is silently dropped.
+    std::string text = "call:say{quote: 'he said \"hi\" loudly'}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "say");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["quote"] == "he said \"hi\" loudly");
+    }
+}
+
+static void test_parse_call_verb_backtick_with_inner_doublequote() {
+    // Same escape concern as the single-quote case, but with the
+    // backtick string flavor.
+    std::string text = "call:say{quote: `he said \"hi\" loudly`}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["quote"] == "he said \"hi\" loudly");
+    }
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // SSE Emitter tests
@@ -893,6 +1232,7 @@ static void test_pflash_config_defaults() {
     TEST_ASSERT(cfg.pflash_keep_ratio > 0.04f && cfg.pflash_keep_ratio < 0.06f);
     TEST_ASSERT(cfg.pflash_drafter_path.empty());
     TEST_ASSERT(!cfg.pflash_skip_park);
+    TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
 }
 
 static void test_pflash_config_modes() {
@@ -952,6 +1292,74 @@ static void test_pflash_threshold_always_mode() {
     bool should = (cfg.pflash_mode == ServerConfig::PflashMode::ALWAYS) ||
                   (cfg.pflash_mode == ServerConfig::PflashMode::AUTO && n_prompt >= cfg.pflash_threshold);
     TEST_ASSERT(should);
+}
+
+static void test_pflash_config_upstream_defaults() {
+    ServerConfig cfg;
+    TEST_ASSERT(cfg.pflash_upstream_base.empty());
+    TEST_ASSERT(cfg.pflash_upstream_key.empty());
+    TEST_ASSERT(cfg.pflash_upstream_model.empty());
+    TEST_ASSERT(cfg.pflash_curve.empty());
+}
+
+static void test_pflash_curve_interpolation() {
+    ServerConfig cfg;
+    cfg.pflash_curve = {{10000, 0.50f}, {40000, 0.20f}, {100000, 0.10f}};
+
+    // Replicate the piecewise logic from http_server.cpp
+    auto keep = [&](int n) -> float {
+        const auto & curve = cfg.pflash_curve;
+        if (n <= curve.front().first) return curve.front().second;
+        if (n >= curve.back().first)  return curve.back().second;
+        for (size_t i = 0; i + 1 < curve.size(); ++i) {
+            if (n <= curve[i + 1].first) {
+                float t = (float)(n - curve[i].first) /
+                          (float)(curve[i + 1].first - curve[i].first);
+                return curve[i].second + t * (curve[i + 1].second - curve[i].second);
+            }
+        }
+        return curve.back().second;
+    };
+
+    // Below first breakpoint
+    TEST_ASSERT(keep(5000) == 0.50f);
+    // At first breakpoint
+    TEST_ASSERT(keep(10000) == 0.50f);
+    // Midpoint between 10k and 40k
+    float mid = keep(25000);
+    TEST_ASSERT(mid > 0.20f && mid < 0.50f);
+    // At second breakpoint
+    TEST_ASSERT(std::fabs(keep(40000) - 0.20f) < 0.001f);
+    // Above last breakpoint
+    TEST_ASSERT(keep(200000) == 0.10f);
+}
+
+static void test_pflash_curve_empty_uses_flat() {
+    ServerConfig cfg;
+    cfg.pflash_keep_ratio = 0.05f;
+    // With empty curve, should fall back to flat ratio
+    TEST_ASSERT(cfg.pflash_curve.empty());
+    TEST_ASSERT(cfg.pflash_keep_ratio == 0.05f);
+}
+
+static void test_pflash_upstream_proxy_config() {
+    ServerConfig cfg;
+    cfg.pflash_upstream_base = "http://localhost:8080/v1";
+    cfg.pflash_upstream_key = "test-key";
+    cfg.pflash_upstream_model = "test-model";
+
+    TEST_ASSERT(!cfg.pflash_upstream_base.empty());
+    TEST_ASSERT(cfg.pflash_upstream_key == "test-key");
+    TEST_ASSERT(cfg.pflash_upstream_model == "test-model");
+}
+
+static void test_pflash_raw_body_preserved() {
+    ParsedRequest req;
+    req.raw_body = {{"model", "test"}, {"messages", json::array()}, {"temperature", 0.7}};
+
+    TEST_ASSERT(req.raw_body.contains("model"));
+    TEST_ASSERT(req.raw_body.contains("temperature"));
+    TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
 }
 
 static void test_pflash_placement_same_backend_local() {
@@ -1037,6 +1445,77 @@ static void test_pflash_placement_usage_gate() {
         /*pflash_enabled=*/true, /*has_decode_draft=*/false));
     TEST_ASSERT(pflash_drafter_placement_used(
         /*pflash_enabled=*/true, /*has_decode_draft=*/true));
+}
+
+static void test_draft_residency_parse() {
+    DraftResidencyPolicy policy = DraftResidencyPolicy::Auto;
+    TEST_ASSERT(parse_draft_residency_policy("auto", policy));
+    TEST_ASSERT(policy == DraftResidencyPolicy::Auto);
+    TEST_ASSERT(parse_draft_residency_policy("persistent", policy));
+    TEST_ASSERT(policy == DraftResidencyPolicy::Persistent);
+    TEST_ASSERT(parse_draft_residency_policy("request-scoped", policy));
+    TEST_ASSERT(policy == DraftResidencyPolicy::RequestScoped);
+    TEST_ASSERT(parse_draft_residency_policy("request_scoped", policy));
+    TEST_ASSERT(policy == DraftResidencyPolicy::RequestScoped);
+    TEST_ASSERT(!parse_draft_residency_policy("request", policy));
+}
+
+static void test_draft_residency_pflash_auto() {
+    auto action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/false,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
+
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            /*low_vram_hint=*/true,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
+}
+
+static void test_draft_residency_dflash_auto_and_request_scoped() {
+    auto action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::DFlashDecode,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
+
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::DFlashDecode,
+            /*low_vram_hint=*/true,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
+
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::RequestScoped,
+        DraftResidencyContext{
+            DraftResidencyUse::DFlashDecode,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
+
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Persistent,
+        DraftResidencyContext{
+            DraftResidencyUse::DFlashDecode,
+            /*low_vram_hint=*/true,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1267,6 +1746,37 @@ static void test_validate_layer_split_weights_shape() {
     TEST_ASSERT(validate_device_placement(placement, -1).empty());
 }
 
+static void test_backend_precision_cuda_sm_policy() {
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(90) == GGML_TYPE_BF16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(80) == GGML_TYPE_BF16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(75) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(70) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(60) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(62) == GGML_TYPE_F32);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(61) == GGML_TYPE_F32);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(52) == GGML_TYPE_F32);
+}
+
+static void test_backend_precision_hip_arch_policy() {
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx90a") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx942") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx950") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1100") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1200") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx906") == GGML_TYPE_F16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1030") == GGML_TYPE_F16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx803") == GGML_TYPE_F32);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("") == GGML_TYPE_F32);
+}
+
+static void test_backend_precision_activation_type_combine() {
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_BF16) == GGML_TYPE_BF16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_F16) == GGML_TYPE_F16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F16, GGML_TYPE_BF16) == GGML_TYPE_F16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F16, GGML_TYPE_F32) == GGML_TYPE_F32);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F32, GGML_TYPE_BF16) == GGML_TYPE_F32);
+}
+
 struct MockLayerSplitAdapter : LayerSplitAdapter {
     int max_ctx = 128;
     bool reset_called = false;
@@ -1282,8 +1792,10 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     std::vector<int32_t> emitted_tokens;
     bool dflash_enabled = false;
     bool dflash_called = false;
+    bool sampling_enabled = false;
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
+    int prefill_chunk = 0;
 
     const char * name() const override { return "mock"; }
     bool init() override { return true; }
@@ -1293,6 +1805,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         current_pos = 0;
         current_last = -1;
     }
+    int prefill_chunk_tokens() const override { return prefill_chunk; }
     bool prefill(const std::vector<int32_t> & prompt,
                  int base_pos, int & last_tok) override {
         prefill_bases.push_back(base_pos);
@@ -1316,10 +1829,12 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         return true;
     }
     bool can_dflash_decode() const override { return dflash_enabled; }
+    bool supports_cpu_sampling() const override { return sampling_enabled; }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
-                       const DaemonIO & io) override {
+                       const DaemonIO & io, float & accept_rate_out) override {
         (void)prompt;
+        accept_rate_out = 0.0f;
         dflash_called = true;
         dflash_base = base_pos;
         dflash_last = last_tok;
@@ -1410,6 +1925,64 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     TEST_ASSERT(raw->dflash_last == 99);
 }
 
+static void test_layer_split_backend_sampling_capability_gate() {
+    {
+        auto * raw = new MockLayerSplitAdapter();
+        LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+        GenerateRequest req;
+        req.prompt = {10, 11};
+        req.n_gen = 1;
+        req.do_sample = true;
+        req.sampler.temp = 0.8f;
+        DaemonIO io;
+        GenerateResult result = backend.generate(req, io);
+
+        TEST_ASSERT(!result.ok);
+        TEST_ASSERT(result.error == "sampling_unsupported");
+    }
+
+    {
+        auto * raw = new MockLayerSplitAdapter();
+        raw->sampling_enabled = true;
+        LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+        GenerateRequest req;
+        req.prompt = {10, 11};
+        req.n_gen = 1;
+        req.do_sample = true;
+        req.sampler.temp = 0.8f;
+        DaemonIO io;
+        GenerateResult result = backend.generate(req, io);
+
+        TEST_ASSERT(result.ok);
+        TEST_ASSERT(result.tokens.size() == 1);
+        TEST_ASSERT(result.tokens[0] == 12);
+    }
+}
+
+static void test_layer_split_backend_chunks_prefill_by_adapter_limit() {
+    auto * raw = new MockLayerSplitAdapter();
+    raw->prefill_chunk = 3;
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+    GenerateRequest req;
+    req.prompt = {1, 2, 3, 4, 5, 6, 7, 8};
+    req.n_gen = 1;
+    DaemonIO io;
+    GenerateResult result = backend.generate(req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(raw->prefill_bases.size() == 3);
+    TEST_ASSERT(raw->prefill_sizes.size() == 3);
+    TEST_ASSERT(raw->prefill_bases[0] == 0);
+    TEST_ASSERT(raw->prefill_sizes[0] == 3);
+    TEST_ASSERT(raw->prefill_bases[1] == 3);
+    TEST_ASSERT(raw->prefill_sizes[1] == 3);
+    TEST_ASSERT(raw->prefill_bases[2] == 6);
+    TEST_ASSERT(raw->prefill_sizes[2] == 2);
+}
+
 static void test_layer_split_compress_nopark_uses_default_drafter_path() {
     const std::string ids_path = "/tmp/dflash_test_layer_split_compress_ids.bin";
     unlink(ids_path.c_str());
@@ -1463,12 +2036,12 @@ struct MockBackend : ModelBackend {
     bool park(const std::string &) override { return true; }
     bool unpark(const std::string &) override { return true; }
     bool is_target_parked() const override { return false; }
-    GenerateResult generate(const GenerateRequest &, const DaemonIO &) override { return {}; }
+    GenerateResult generate_impl(const GenerateRequest &, const DaemonIO &) override { return {}; }
     bool snapshot_save(int) override { return false; }
     void snapshot_free(int) override {}
     bool snapshot_used(int) const override { return false; }
     int  snapshot_cur_pos(int) const override { return 0; }
-    GenerateResult restore_and_generate(int, const GenerateRequest &, const DaemonIO &) override { return {}; }
+    GenerateResult restore_and_generate_impl(int, const GenerateRequest &, const DaemonIO &) override { return {}; }
     bool handle_compress(const std::string &, const DaemonIO &) override { return false; }
     void free_drafter() override {}
     void shutdown() override {}
@@ -1877,6 +2450,21 @@ static void test_backend_ipc_payload_bounds() {
     TEST_ASSERT(!backend_ipc_payload_in_bounds(9, 8, 16));
     TEST_ASSERT(!backend_ipc_payload_in_bounds(
         std::numeric_limits<size_t>::max(), 1, 16));
+}
+
+static void test_backend_ipc_shared_payload_map_sizing() {
+    size_t map_bytes = 0;
+    TEST_ASSERT(backend_ipc_shared_payload_map_bytes(1024, map_bytes));
+    TEST_ASSERT(map_bytes == 1024 + backend_ipc_shared_payload_header_bytes());
+
+    BackendIpcSharedPayloadHeader header;
+    header.sequence = 7;
+    header.bytes = 1024;
+    TEST_ASSERT(header.sequence == 7);
+    TEST_ASSERT(header.bytes == 1024);
+
+    TEST_ASSERT(!backend_ipc_shared_payload_map_bytes(
+        std::numeric_limits<size_t>::max(), map_bytes));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2355,6 +2943,7 @@ static void test_props_runtime_shape() {
     cfg.kv_cache_k      = "tq3_0";
     cfg.kv_cache_v      = "tq3_0";
     cfg.lazy_draft      = false;
+    cfg.draft_residency = DraftResidencyPolicy::Persistent;
     cfg.target_sharding = false;
     cfg.chunk           = 512;
     cfg.target_device   = "auto:0";
@@ -2372,10 +2961,12 @@ static void test_props_runtime_shape() {
     TEST_ASSERT(rt["kv_cache_k"].get<std::string>()      == "tq3_0");
     TEST_ASSERT(rt["kv_cache_v"].get<std::string>()      == "tq3_0");
     TEST_ASSERT(rt["lazy_draft"].get<bool>()             == false);
+    TEST_ASSERT(rt["draft_residency"].get<std::string>() == "persistent");
     TEST_ASSERT(rt["target_sharding"].get<bool>()        == false);
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
     TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
     TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
+    TEST_ASSERT(body["pflash"]["draft_residency"].get<std::string>() == "persistent");
 
     // draft_device is null when no draft model is loaded.
     cfg.draft_device.clear();
@@ -2484,8 +3075,10 @@ struct EmptySpecRetryBackend : MockBackend {
     int restore_calls = 0;
     bool generate_saw_force_ar = false;
     bool restore_saw_force_ar = false;
+    bool generate_first_empty_visible = false;
+    bool restore_first_empty_visible = false;
 
-    GenerateResult generate(const GenerateRequest & req,
+    GenerateResult generate_impl(const GenerateRequest & req,
                             const DaemonIO &) override {
         generate_calls++;
         GenerateResult result;
@@ -2495,11 +3088,15 @@ struct EmptySpecRetryBackend : MockBackend {
             result.tokens = {42};
         } else {
             result.spec_decode_ran = true;
+            if (generate_first_empty_visible) {
+                result.tokens = {2};
+                result.empty_visible_output = true;
+            }
         }
         return result;
     }
 
-    GenerateResult restore_and_generate(int, const GenerateRequest & req,
+    GenerateResult restore_and_generate_impl(int, const GenerateRequest & req,
                                         const DaemonIO &) override {
         restore_calls++;
         GenerateResult result;
@@ -2509,6 +3106,10 @@ struct EmptySpecRetryBackend : MockBackend {
             result.tokens = {84};
         } else {
             result.spec_decode_ran = true;
+            if (restore_first_empty_visible) {
+                result.tokens = {2};
+                result.empty_visible_output = true;
+            }
         }
         return result;
     }
@@ -2521,7 +3122,7 @@ static void test_model_backend_retries_empty_spec_generate_once_with_ar() {
     req.n_gen = 4;
     DaemonIO io;
 
-    GenerateResult result = backend.generate_with_empty_spec_fallback(req, io);
+    GenerateResult result = backend.generate(req, io);
 
     TEST_ASSERT(result.ok);
     TEST_ASSERT(result.tokens.size() == 1);
@@ -2539,11 +3140,49 @@ static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
     DaemonIO io;
 
     GenerateResult result =
-        backend.restore_and_generate_with_empty_spec_fallback(7, req, io);
+        backend.restore_and_generate(7, req, io);
 
     TEST_ASSERT(result.ok);
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 84);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.restore_calls == 2);
+    TEST_ASSERT(backend.restore_saw_force_ar);
+}
+
+static void test_model_backend_retries_empty_visible_spec_generate_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    backend.generate_first_empty_visible = true;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result = backend.generate(req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 42);
+    TEST_ASSERT(!result.empty_visible_output);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.generate_calls == 2);
+    TEST_ASSERT(backend.generate_saw_force_ar);
+}
+
+static void test_model_backend_retries_empty_visible_spec_restore_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    backend.restore_first_empty_visible = true;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result = backend.restore_and_generate(7, req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 84);
+    TEST_ASSERT(!result.empty_visible_output);
     TEST_ASSERT(result.spec_decode_ran);
     TEST_ASSERT(backend.restore_calls == 2);
     TEST_ASSERT(backend.restore_saw_force_ar);
@@ -2653,6 +3292,33 @@ int main() {
     RUN_TEST(test_parse_no_tools);
     RUN_TEST(test_parse_tool_code_wrapper);
     RUN_TEST(test_parse_tool_allowed_filter);
+    RUN_TEST(test_parse_call_verb_empty_args);
+    RUN_TEST(test_parse_call_verb_strict_json_args);
+    RUN_TEST(test_parse_call_verb_namespaced_verb);
+    RUN_TEST(test_parse_call_verb_whitespace_before_key);
+    RUN_TEST(test_parse_call_verb_missing_close_brace_rejected);
+    RUN_TEST(test_parse_call_verb_narrative_without_body_rejected);
+    RUN_TEST(test_parse_call_verb_underscore_prefix);
+    RUN_TEST(test_parse_call_verb_nested_object_args);
+    RUN_TEST(test_parse_call_verb_back_to_back);
+    RUN_TEST(test_parse_call_verb_relaxed_single_quotes);
+    RUN_TEST(test_parse_call_verb_glued_to_word_rejected);
+    RUN_TEST(test_parse_call_verb_does_not_hijack_inner_name);
+    // PR #341 imports (relocated alongside the test bodies above)
+    RUN_TEST(test_parse_call_verb_single);
+    RUN_TEST(test_parse_call_verb_namespaced);
+    RUN_TEST(test_parse_call_verb_snake_and_hyphen);
+    RUN_TEST(test_parse_call_verb_tool_allowed_filter);
+    RUN_TEST(test_parse_call_verb_inline_prose_rejected);
+    RUN_TEST(test_parse_call_verb_inline_prose_after_space);
+    RUN_TEST(test_parse_call_verb_malformed_args);
+    RUN_TEST(test_parse_call_verb_inner_brace_in_string);
+    RUN_TEST(test_parse_call_verb_unquoted_keys);
+    RUN_TEST(test_parse_call_verb_cleaned_text);
+    RUN_TEST(test_parse_call_verb_intercept_inner_json);
+    RUN_TEST(test_parse_call_verb_multiline_args);
+    RUN_TEST(test_parse_call_verb_singlequote_with_inner_doublequote);
+    RUN_TEST(test_parse_call_verb_backtick_with_inner_doublequote);
 
     std::fprintf(stderr, "\n── SSE Emitter ──\n");
     RUN_TEST(test_emitter_reasoning_split_openai);
@@ -2701,17 +3367,32 @@ int main() {
     RUN_TEST(test_pflash_compress_result_defaults);
     RUN_TEST(test_pflash_threshold_auto_mode);
     RUN_TEST(test_pflash_threshold_always_mode);
+    RUN_TEST(test_pflash_config_upstream_defaults);
+    RUN_TEST(test_pflash_curve_interpolation);
+    RUN_TEST(test_pflash_curve_empty_uses_flat);
+    RUN_TEST(test_pflash_upstream_proxy_config);
+    RUN_TEST(test_pflash_raw_body_preserved);
     RUN_TEST(test_pflash_placement_same_backend_local);
     RUN_TEST(test_pflash_placement_mixed_backend_remote);
     RUN_TEST(test_pflash_placement_auto_draft_follows_target);
     RUN_TEST(test_pflash_placement_disabled_never_remote);
     RUN_TEST(test_pflash_placement_usage_gate);
+    RUN_TEST(test_draft_residency_parse);
+    RUN_TEST(test_draft_residency_pflash_auto);
+    RUN_TEST(test_draft_residency_dflash_auto_and_request_scoped);
 
     std::fprintf(stderr, "\n── Backend IPC ──\n");
     RUN_TEST(test_backend_ipc_rejects_file_work_dir);
     RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
     RUN_TEST(test_backend_ipc_payload_transport_parse);
     RUN_TEST(test_backend_ipc_payload_bounds);
+
+    std::fprintf(stderr, "\n── Backend IPC ──\n");
+    RUN_TEST(test_backend_ipc_rejects_file_work_dir);
+    RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
+    RUN_TEST(test_backend_ipc_payload_transport_parse);
+    RUN_TEST(test_backend_ipc_payload_bounds);
+    RUN_TEST(test_backend_ipc_shared_payload_map_sizing);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
     RUN_TEST(test_jinja_render_basic);
@@ -2729,7 +3410,12 @@ int main() {
     RUN_TEST(test_parse_target_device_list_mixed_backend_multi_remote);
     RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
     RUN_TEST(test_validate_layer_split_weights_shape);
+    RUN_TEST(test_backend_precision_cuda_sm_policy);
+    RUN_TEST(test_backend_precision_hip_arch_policy);
+    RUN_TEST(test_backend_precision_activation_type_combine);
     RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
+    RUN_TEST(test_layer_split_backend_sampling_capability_gate);
+    RUN_TEST(test_layer_split_backend_chunks_prefill_by_adapter_limit);
     RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
     RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
     RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);
@@ -2785,6 +3471,8 @@ int main() {
     std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");
     RUN_TEST(test_model_backend_retries_empty_spec_generate_once_with_ar);
     RUN_TEST(test_model_backend_retries_empty_spec_restore_once_with_ar);
+    RUN_TEST(test_model_backend_retries_empty_visible_spec_generate_once_with_ar);
+    RUN_TEST(test_model_backend_retries_empty_visible_spec_restore_once_with_ar);
 
     std::fprintf(stderr, "\n── GenerateResult.accept_rate ──\n");
     RUN_TEST(test_generate_result_accept_rate_defaults_to_zero);

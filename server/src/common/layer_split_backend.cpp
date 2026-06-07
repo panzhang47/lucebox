@@ -67,6 +67,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     if (reset_state) adapter_->reset_request_state();
 
     const int prompt_len = (int)req.prompt.size();
+    const int adapter_chunk = adapter_->prefill_chunk_tokens();
     int last_tok = (base_pos > 0 && prompt_len == 0)
         ? adapter_->current_last_token()
         : -1;
@@ -74,6 +75,9 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     auto t_prefill_start = std::chrono::steady_clock::now();
     while (consumed < prompt_len) {
         int n_tokens = prompt_len - consumed;
+        if (adapter_chunk > 0 && n_tokens > adapter_chunk) {
+            n_tokens = adapter_chunk;
+        }
         if (req.snap_pos >= 0 && req.snap_slot >= 0 &&
             req.snap_pos > base_pos + consumed &&
             req.snap_pos < base_pos + consumed + n_tokens) {
@@ -106,11 +110,13 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
         auto t_decode_start = std::chrono::steady_clock::now();
         const bool use_dflash = !req.force_ar_decode && adapter_->can_dflash_decode();
         if (use_dflash) result.spec_decode_ran = true;
+        float dflash_accept_rate = 0.0f;
         const bool ok = use_dflash
             ? adapter_->decode_dflash(req.prompt, base_pos, last_tok, req.n_gen,
-                                      result.tokens, out_io)
+                                      result.tokens, out_io, dflash_accept_rate)
             : adapter_->decode_ar(last_tok, base_pos + (int)req.prompt.size(), req.n_gen,
                                   result.tokens, out_io);
+        if (use_dflash) result.accept_rate = dflash_accept_rate;
         if (!ok) {
             result.error = "decode";
             return result;
@@ -123,8 +129,8 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     return result;
 }
 
-GenerateResult LayerSplitBackend::generate(const GenerateRequest & req,
-                                           const DaemonIO & io) {
+GenerateResult LayerSplitBackend::generate_impl(const GenerateRequest & req,
+                                                const DaemonIO & io) {
     return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/true);
 }
 
@@ -156,7 +162,7 @@ bool LayerSplitBackend::snapshot_adopt(int slot,
     return adapter_ && adapter_->snapshot_adopt(slot, ctx, buf, cur_pos, last_tok);
 }
 
-GenerateResult LayerSplitBackend::restore_and_generate(
+GenerateResult LayerSplitBackend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
     GenerateResult result;
     if (!adapter_ || !adapter_->snapshot_restore(slot)) {

@@ -20,6 +20,7 @@
 //   - Vocab = 100352. BOS = 2. EOS = {2, 24}. Pad = 9.
 
 #pragma once
+#define DFLASH_LAGUNA_INTERNAL_H_INCLUDED
 
 #include <cstdint>
 #include <string>
@@ -136,6 +137,10 @@ bool load_target_gguf_laguna(const std::string & path,
                               ggml_backend_t       backend,
                               LagunaTargetWeights & out);
 
+// Partial loader. With plan.skip_expert_tensors=true this performs the
+// hybrid-MoE load: non-expert tensors go to GPU, expert tensors are kept
+// off-GPU (metadata/shapes stay valid for size queries). Also supports
+// layer-range partial loads via plan.layer_begin/layer_end/load_output.
 bool load_target_gguf_laguna_partial(const std::string & path,
                                       ggml_backend_t backend,
                                       const TargetLoadPlan & plan,

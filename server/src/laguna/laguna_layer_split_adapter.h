@@ -83,6 +83,7 @@ private:
     std::vector<ggml_context *> disk_snapshot_contexts_;
     std::vector<ggml_backend_buffer_t> disk_snapshot_buffers_;
     std::vector<ggml_backend_t> disk_snapshot_backends_;
+    ggml_type activation_type_ = GGML_TYPE_F32;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};

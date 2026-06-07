@@ -14,6 +14,7 @@ the `DFLASH_TOKENIZER` env var.
 """
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -30,7 +31,15 @@ def default_paths():
     }
 
 
-def resolve_draft(draft_dir: str) -> str:
+def _target_version(target_path: str | None) -> str | None:
+    """Extract the model version token (e.g. '3.6') from a target filename."""
+    if not target_path:
+        return None
+    m = re.search(r"[Qq]wen(\d+\.\d+)", os.path.basename(target_path))
+    return m.group(1) if m else None
+
+
+def resolve_draft(draft_dir: str, target_path: str | None = None) -> str:
     if draft_dir.endswith(".safetensors"):
         p = Path(draft_dir)
         if p.is_file():
@@ -42,8 +51,25 @@ def resolve_draft(draft_dir: str) -> str:
         return str(p)
     if p.is_dir():
         for pattern in ("dflash-draft-*.gguf", "*.gguf", "model.safetensors"):
-            for draft in sorted(p.rglob(pattern)):
-                return str(draft)
+            matches = sorted(p.rglob(pattern))
+            if not matches:
+                continue
+            if len(matches) > 1:
+                # Multiple drafts present (e.g. 3.5 and 3.6). sorted()[0] would
+                # pick alphabetically (3.5 before 3.6), which can mismatch the
+                # target. Prefer the draft whose version token matches target.
+                ver = _target_version(target_path)
+                if ver:
+                    preferred = [m for m in matches
+                                 if f"-{ver}-" in m.name or f"-{ver}." in m.name]
+                    if preferred:
+                        matches = preferred
+                if len(matches) > 1:
+                    sys.stderr.write(
+                        f"[run.py] {len(matches)} draft files under {draft_dir}; "
+                        f"using {matches[0].name}. Pass --draft or set "
+                        f"DFLASH_DRAFT to select explicitly.\n")
+            return str(matches[0])
 
     raise FileNotFoundError(
         f"no DFlash draft GGUF or model.safetensors under {draft_dir}. Download it as documented in the README, or pass --draft explicitly."
@@ -118,7 +144,7 @@ def main():
         text = tokenizer.apply_chat_template(msgs, tokenize=False,
                                              add_generation_prompt=True)
 
-    draft_path = resolve_draft(args.draft)
+    draft_path = resolve_draft(args.draft, args.target)
     im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)
     im_end_id = im_end_id[0] if im_end_id else -1
 
