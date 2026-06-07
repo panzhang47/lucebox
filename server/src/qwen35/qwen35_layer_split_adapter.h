@@ -106,6 +106,7 @@ private:
     Qwen35TargetShardIpcClient remote_target_shard_;
     StepGraph draft_sg_;
     StepGraph proj_sg_;
+    ggml_type activation_type_ = GGML_TYPE_F32;
     DrafterContext pflash_drafter_;
     bool pflash_drafter_loaded_ = false;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;

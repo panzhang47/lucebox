@@ -3,6 +3,7 @@
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_types.h"
 #include "../common/moe_hybrid_types_impl.h"
+#include "common/ggml_graph_precision.h"
 #include "common/sampler.h"
 #include "common/dflash_spec_decode.h"
 #include "dflash_draft_graph.h"
@@ -297,7 +298,8 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
     PipelinedDecodeTelemetry tel_layers_accum{};
     int tel_n_tokens = 0;
 
-    // Persistent logits graph (built once, reused per token)
+    // Persistent logits graph (built once, reused per token).
+    // Precision policy (#310): keep the rms-norm input and out_norm in f32.
     StepGraph logits_sg;
     auto project_logits = [&]() -> bool {
         if (!logits_sg.ctx) {
@@ -309,8 +311,13 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             logits_sg.hidden_input = ggml_new_tensor_3d(logits_sg.ctx, GGML_TYPE_F32, hidden, 1, 1);
             ggml_set_input(logits_sg.hidden_input);
             logits_sg.gf = ggml_new_graph_custom(logits_sg.ctx, 1024, false);
-            ggml_tensor * normed = ggml_rms_norm(logits_sg.ctx, logits_sg.hidden_input, target_weights().rms_eps);
-            normed = ggml_mul(logits_sg.ctx, normed, target_weights().out_norm);
+            ggml_tensor * normed = ggml_rms_norm(
+                logits_sg.ctx,
+                rms_norm_input_f32(logits_sg.ctx, logits_sg.hidden_input),
+                target_weights().rms_eps);
+            normed = ggml_mul(
+                logits_sg.ctx, normed,
+                graph_tensor_f32(logits_sg.ctx, target_weights().out_norm));
             logits_sg.logits = ggml_mul_mat(logits_sg.ctx, target_weights().output, normed);
             ggml_set_output(logits_sg.logits);
             ggml_build_forward_expand(logits_sg.gf, logits_sg.logits);
@@ -563,8 +570,13 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             logits_sg.hidden_input = ggml_new_tensor_3d(logits_sg.ctx, GGML_TYPE_F32, hidden, 1, 1);
             ggml_set_input(logits_sg.hidden_input);
             logits_sg.gf = ggml_new_graph_custom(logits_sg.ctx, 1024, false);
-            ggml_tensor * normed = ggml_rms_norm(logits_sg.ctx, logits_sg.hidden_input, target_weights().rms_eps);
-            normed = ggml_mul(logits_sg.ctx, normed, target_weights().out_norm);
+            ggml_tensor * normed = ggml_rms_norm(
+                logits_sg.ctx,
+                rms_norm_input_f32(logits_sg.ctx, logits_sg.hidden_input),
+                target_weights().rms_eps);
+            normed = ggml_mul(
+                logits_sg.ctx, normed,
+                graph_tensor_f32(logits_sg.ctx, target_weights().out_norm));
             logits_sg.logits = ggml_mul_mat(logits_sg.ctx, target_weights().output, normed);
             ggml_set_output(logits_sg.logits);
             ggml_build_forward_expand(logits_sg.gf, logits_sg.logits);
@@ -1121,8 +1133,13 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
     proj_sg.hidden_input = ggml_new_tensor_3d(proj_sg.ctx, GGML_TYPE_F32, hidden, 1, 1);
     ggml_set_input(proj_sg.hidden_input);
     proj_sg.gf = ggml_new_graph_custom(proj_sg.ctx, 1024, false);
-    ggml_tensor * normed = ggml_rms_norm(proj_sg.ctx, proj_sg.hidden_input, target_weights().rms_eps);
-    normed = ggml_mul(proj_sg.ctx, normed, target_weights().out_norm);
+    ggml_tensor * normed = ggml_rms_norm(
+        proj_sg.ctx,
+        rms_norm_input_f32(proj_sg.ctx, proj_sg.hidden_input),
+        target_weights().rms_eps);
+    normed = ggml_mul(
+        proj_sg.ctx, normed,
+        graph_tensor_f32(proj_sg.ctx, target_weights().out_norm));
     proj_sg.logits = ggml_mul_mat(proj_sg.ctx, target_weights().output, normed);
     ggml_set_output(proj_sg.logits);
     ggml_build_forward_expand(proj_sg.gf, proj_sg.logits);
