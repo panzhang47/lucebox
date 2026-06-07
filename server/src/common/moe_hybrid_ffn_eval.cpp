@@ -11,8 +11,6 @@
 
 namespace dflash::common {
 
-namespace {
-
 // NVFP4 scale2: if weight has a per-tensor scale, multiply the matmul result
 // by that scale. No-op when scale==1.0f (non-NVFP4 models).
 inline ggml_tensor * apply_scale2(ggml_context * ctx, ggml_tensor * mm_result, float scale) {
@@ -404,8 +402,6 @@ static bool build_batched_routed_graph(
     return true;
 }
 
-} // namespace (anon)
-
 // ── Public API ──────────────────────────────────────────────────────────────────
 
 bool build_cached_hot_graph(
@@ -606,6 +602,75 @@ bool build_cached_cold_graph(
     ggml_set_output(out.output);
     ggml_build_forward_expand(out.gf, out.output);
     out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+    if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
+        out.free();
+        return false;
+    }
+    return true;
+}
+
+bool build_cached_hot_batched_graph(
+    CachedHotBatchedGraph & out,
+    ggml_backend_t gpu_backend,
+    MoeHybridLayerStorage & storage,
+    const MoeLayerDesc & desc,
+    const MoeHybridConfig & cfg,
+    int n_tokens) {
+
+    out.free();
+    out.n_tokens = n_tokens;
+
+    const int n_embd = cfg.n_embd;
+    const int n_used = cfg.n_expert_used;
+    const int n_ff_exp = cfg.n_ff_exp;
+
+    ggml_init_params ip{};
+    ip.mem_size = 128 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) return false;
+
+    out.inp = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(out.inp);
+    out.sel = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_set_input(out.sel);
+    out.wts = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_used, n_tokens);
+    ggml_set_input(out.wts);
+
+    ggml_tensor * routed = nullptr;
+    build_batched_routed_graph(out.ctx,
+        storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
+        desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+
+    // Shared expert (always on GPU)
+    ggml_tensor * combined = routed;
+    const bool has_shared = (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp);
+    if (has_shared) {
+        ggml_tensor * sh_gate = apply_scale2(out.ctx,
+            ggml_mul_mat(out.ctx, desc.ffn_gate_shexp, out.inp), desc.ffn_gate_shexp_s);
+        ggml_tensor * sh_up = apply_scale2(out.ctx,
+            ggml_mul_mat(out.ctx, desc.ffn_up_shexp, out.inp), desc.ffn_up_shexp_s);
+        ggml_tensor * sh_gu = ggml_swiglu_split(out.ctx, sh_gate, sh_up);
+        ggml_tensor * shared = apply_scale2(out.ctx,
+            ggml_mul_mat(out.ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
+        if (desc.ffn_gate_inp_shexp) {
+            ggml_tensor * shared_gate = apply_scale2(out.ctx,
+                ggml_mul_mat(out.ctx, desc.ffn_gate_inp_shexp, out.inp), desc.ffn_gate_inp_shexp_s);
+            shared_gate = ggml_sigmoid(out.ctx, shared_gate);
+            shared = ggml_mul(out.ctx, shared, shared_gate);
+        }
+        combined = combined ? ggml_add(out.ctx, combined, shared) : shared;
+    }
+
+    if (!combined) { out.free(); return false; }
+    out.output = combined;
+
+    out.gf = ggml_new_graph_custom(out.ctx, 4096, false);
+    ggml_set_output(out.output);
+    ggml_build_forward_expand(out.gf, out.output);
+    out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
     if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
         out.free();
         return false;
@@ -1177,7 +1242,44 @@ bool eval_moe_hot_only_batched(
         }
     }
 
-    // Build hot GPU graph
+    // ── Fast path: use cached graph (avoids rebuild + realloc) ──
+    auto & cached = storage.hot_batched_graph;
+    if (cached.n_tokens == n_tokens && cached.valid()) {
+        // Reuse pre-built graph: just upload data and compute
+        ggml_backend_tensor_set(cached.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        ggml_backend_tensor_set(cached.sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+        ggml_backend_tensor_set(cached.wts, selected_weights, 0, sizeof(float) * (size_t)total_slots);
+
+        auto st = ggml_backend_graph_compute(gpu_backend, cached.gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            if (err) *err = "hot_only cached compute failed";
+            return false;
+        }
+        ggml_backend_tensor_get(cached.output, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        return true;
+    }
+
+    // ── Slow path: build graph (first call or size mismatch) ──
+    // Try to build and cache for this n_tokens size
+    if (n_tokens == MMQ_SAFE_SUB_BATCH || (n_hot_stack == 0 || n_hot_stack >= cfg.n_expert)) {
+        if (build_cached_hot_batched_graph(cached, gpu_backend, storage, desc, cfg, n_tokens)) {
+            // Successfully cached — use it immediately
+            ggml_backend_tensor_set(cached.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+            ggml_backend_tensor_set(cached.sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+            ggml_backend_tensor_set(cached.wts, selected_weights, 0, sizeof(float) * (size_t)total_slots);
+
+            auto st = ggml_backend_graph_compute(gpu_backend, cached.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                if (err) *err = "hot_only cached compute failed (first)";
+                return false;
+            }
+            ggml_backend_tensor_get(cached.output, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+            return true;
+        }
+        // Fall through to uncached path if build fails
+    }
+
+    // ── Uncached fallback (remainder sub-batches with n_tokens < MMQ_SAFE_SUB_BATCH) ──
     ggml_init_params ip{};
     ip.mem_size = 128 * 1024 * 1024;
     ip.mem_buffer = nullptr;

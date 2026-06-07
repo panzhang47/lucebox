@@ -205,4 +205,13 @@ bool build_cached_cold_graph(
     int n_ff_exp,
     int n_cold);
 
+// Build cached hot-only batched graph for prefill (n_tokens=MMQ_SAFE_SUB_BATCH).
+bool build_cached_hot_batched_graph(
+    CachedHotBatchedGraph & out,
+    ggml_backend_t gpu_backend,
+    MoeHybridLayerStorage & storage,
+    const MoeLayerDesc & desc,
+    const MoeHybridConfig & cfg,
+    int n_tokens);
+
 }  // namespace dflash::common

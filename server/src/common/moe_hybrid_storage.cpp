@@ -26,6 +26,17 @@ void CachedFfnGraph::free() {
     n_hot = 0;
 }
 
+void CachedHotBatchedGraph::free() {
+    if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
+    if (ctx) { ggml_free(ctx); ctx = nullptr; }
+    gf = nullptr;
+    inp = nullptr;
+    sel = nullptr;
+    wts = nullptr;
+    output = nullptr;
+    n_tokens = 0;
+}
+
 namespace {
 
 static bool read_expert_slices(ggml_backend_t backend,

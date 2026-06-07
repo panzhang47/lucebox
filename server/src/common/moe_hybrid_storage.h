@@ -54,6 +54,22 @@ struct CachedFfnGraph {
     void free();
 };
 
+// Cached batched FFN graph for hot-only prefill (n_tokens = MMQ_SAFE_SUB_BATCH).
+// Eliminates per-call graph rebuild + gallocr planning overhead.
+struct CachedHotBatchedGraph {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_tensor * inp = nullptr;        // [n_embd, n_tokens] F32 input
+    ggml_tensor * sel = nullptr;        // [n_used, n_tokens] I32 hot-local IDs
+    ggml_tensor * wts = nullptr;        // [n_used, n_tokens] F32 expert weights
+    ggml_tensor * output = nullptr;     // [n_embd, n_tokens] F32 output
+    int n_tokens = 0;
+
+    bool valid() const { return ctx && gf && alloc && output; }
+    void free();
+};
+
 struct MoeHybridLayerStorage {
     ggml_context * hot_ctx = nullptr;
     ggml_backend_buffer_t hot_buf = nullptr;
@@ -113,6 +129,9 @@ struct MoeHybridLayerStorage {
     // Cached FFN graphs for common-case expert counts.
     CachedFfnGraph hot_graph;
     CachedFfnGraph cold_graph;
+
+    // Cached batched hot-only graph for prefill sub-batches (n_tokens=4).
+    CachedHotBatchedGraph hot_batched_graph;
 };
 
 struct MoeHybridStorage {
