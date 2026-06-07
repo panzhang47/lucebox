@@ -263,6 +263,8 @@ add_library(dflash_common STATIC
     src/common/cold_ffn_cpu.cpp
     src/common/moe_hybrid_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
+    src/qwen35/qwen35_target_shard_ipc.cpp
+    src/qwen35/qwen35_target_shard_ipc_daemon.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
@@ -741,6 +743,23 @@ if(DFLASH27B_TESTS)
             else()
                 target_link_libraries(dflash_server PRIVATE hip::host)
             endif()
+        endif()
+
+        # Copy share/status.html next to the binary so it can be found at runtime.
+        # Guard on the target: dflash_server is skipped when CURL is absent
+        # (e.g. CI without libcurl-dev), and referencing a missing target in
+        # add_custom_command/install is a hard CMake configure error.
+        if(TARGET dflash_server)
+            add_custom_command(TARGET dflash_server POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<TARGET_FILE_DIR:dflash_server>/share"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
+                    "$<TARGET_FILE_DIR:dflash_server>/share/status.html"
+                COMMENT "Copying status.html to build/share/"
+            )
+            install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
+                    DESTINATION share)
         endif()
     endif()
 

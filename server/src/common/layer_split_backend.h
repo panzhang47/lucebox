@@ -37,9 +37,10 @@ public:
     virtual bool decode_dflash(const std::vector<int32_t> & prompt,
                                int base_pos, int last_tok, int n_gen,
                                std::vector<int32_t> & out_tokens,
-                               const DaemonIO & io) {
+                               const DaemonIO & io, float & accept_rate_out) {
         (void)prompt; (void)base_pos; (void)last_tok; (void)n_gen;
         (void)out_tokens; (void)io;
+        accept_rate_out = 0.0f;
         return false;
     }
 
@@ -60,6 +61,16 @@ public:
     virtual bool snapshot_used(int slot) const { (void)slot; return false; }
     virtual int snapshot_cur_pos(int slot) const { (void)slot; return 0; }
     virtual bool snapshot_restore(int slot) { (void)slot; return false; }
+    virtual ModelBackend::SnapshotRef snapshot_ref(int slot) const {
+        (void)slot;
+        return {};
+    }
+    virtual bool snapshot_adopt(int slot, ggml_context * ctx,
+                                ggml_backend_buffer_t buf, int cur_pos,
+                                int32_t last_tok) {
+        (void)slot; (void)ctx; (void)buf; (void)cur_pos; (void)last_tok;
+        return false;
+    }
     virtual int current_last_token() const { return -1; }
 
     virtual void shutdown() = 0;
@@ -87,6 +98,10 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    SnapshotRef snapshot_ref(int slot) const override;
+    bool snapshot_adopt(int slot, ggml_context * ctx,
+                        ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok = -1) override;
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;

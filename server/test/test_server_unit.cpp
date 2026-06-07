@@ -17,6 +17,7 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
@@ -33,6 +34,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <limits>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -1675,15 +1677,48 @@ static void test_parse_target_device_list_same_backend() {
     TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
     TEST_ASSERT(placement.gpu == 0);
     TEST_ASSERT(placement.is_layer_split());
+    TEST_ASSERT(!placement.is_mixed_layer_split());
+    TEST_ASSERT(placement.layer_split_backends.size() == 2);
+    TEST_ASSERT(placement.layer_split_backends[0] == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.layer_split_backends[1] == PlacementBackend::Cuda);
     TEST_ASSERT(placement.layer_split_gpus.size() == 2);
     TEST_ASSERT(placement.layer_split_gpus[0] == 0);
     TEST_ASSERT(placement.layer_split_gpus[1] == 1);
     TEST_ASSERT(placement.layer_split_weights.empty());
 }
 
-static void test_parse_target_device_list_rejects_mixed_backend() {
+static void test_parse_target_device_list_mixed_backend() {
     DevicePlacement placement;
-    TEST_ASSERT(!parse_placement_device_list("cuda:0,hip:1", placement));
+    TEST_ASSERT(parse_placement_device_list("cuda:0,hip:1", placement));
+    TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.gpu == 0);
+    TEST_ASSERT(placement.is_layer_split());
+    TEST_ASSERT(placement.is_mixed_layer_split());
+    TEST_ASSERT(placement.layer_split_backends.size() == 2);
+    TEST_ASSERT(placement.layer_split_backends[0] == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.layer_split_backends[1] == PlacementBackend::Hip);
+    TEST_ASSERT(placement.layer_split_backend(0) == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.layer_split_backend(1) == PlacementBackend::Hip);
+    TEST_ASSERT(placement.layer_split_gpus.size() == 2);
+    TEST_ASSERT(placement.layer_split_gpus[0] == 0);
+    TEST_ASSERT(placement.layer_split_gpus[1] == 1);
+}
+
+static void test_parse_target_device_list_mixed_backend_multi_remote() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,hip:0,hip:1", placement));
+    TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.gpu == 0);
+    TEST_ASSERT(placement.is_layer_split());
+    TEST_ASSERT(placement.is_mixed_layer_split());
+    TEST_ASSERT(placement.layer_split_backends.size() == 3);
+    TEST_ASSERT(placement.layer_split_backends[0] == PlacementBackend::Cuda);
+    TEST_ASSERT(placement.layer_split_backends[1] == PlacementBackend::Hip);
+    TEST_ASSERT(placement.layer_split_backends[2] == PlacementBackend::Hip);
+    TEST_ASSERT(placement.layer_split_gpus.size() == 3);
+    TEST_ASSERT(placement.layer_split_gpus[0] == 0);
+    TEST_ASSERT(placement.layer_split_gpus[1] == 0);
+    TEST_ASSERT(placement.layer_split_gpus[2] == 1);
 }
 
 static void test_parse_target_device_list_single_gpu_is_not_layer_split() {
@@ -1692,6 +1727,8 @@ static void test_parse_target_device_list_single_gpu_is_not_layer_split() {
     TEST_ASSERT(placement.backend == PlacementBackend::Hip);
     TEST_ASSERT(placement.gpu == 2);
     TEST_ASSERT(!placement.is_layer_split());
+    TEST_ASSERT(!placement.is_mixed_layer_split());
+    TEST_ASSERT(placement.layer_split_backends.empty());
     TEST_ASSERT(placement.layer_split_gpus.empty());
 }
 
@@ -1707,6 +1744,37 @@ static void test_validate_layer_split_weights_shape() {
 
     placement.layer_split_weights = {1.0, 2.0};
     TEST_ASSERT(validate_device_placement(placement, -1).empty());
+}
+
+static void test_backend_precision_cuda_sm_policy() {
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(90) == GGML_TYPE_BF16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(80) == GGML_TYPE_BF16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(75) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(70) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(60) == GGML_TYPE_F16);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(62) == GGML_TYPE_F32);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(61) == GGML_TYPE_F32);
+    TEST_ASSERT(select_cuda_backend_precision_type_for_sm(52) == GGML_TYPE_F32);
+}
+
+static void test_backend_precision_hip_arch_policy() {
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx90a") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx942") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx950") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1100") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1200") == GGML_TYPE_BF16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx906") == GGML_TYPE_F16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx1030") == GGML_TYPE_F16);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx803") == GGML_TYPE_F32);
+    TEST_ASSERT(select_hip_activation_precision_type_for_arch("") == GGML_TYPE_F32);
+}
+
+static void test_backend_precision_activation_type_combine() {
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_BF16) == GGML_TYPE_BF16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_F16) == GGML_TYPE_F16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F16, GGML_TYPE_BF16) == GGML_TYPE_F16);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F16, GGML_TYPE_F32) == GGML_TYPE_F32);
+    TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F32, GGML_TYPE_BF16) == GGML_TYPE_F32);
 }
 
 struct MockLayerSplitAdapter : LayerSplitAdapter {
@@ -1764,8 +1832,9 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     bool supports_cpu_sampling() const override { return sampling_enabled; }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
-                       const DaemonIO & io) override {
+                       const DaemonIO & io, float & accept_rate_out) override {
         (void)prompt;
+        accept_rate_out = 0.0f;
         dflash_called = true;
         dflash_base = base_pos;
         dflash_last = last_tok;
@@ -2354,6 +2423,48 @@ static void test_backend_ipc_payload_pipe_round_trip() {
     TEST_ASSERT(read_exact_fd(status_pipe[0], &status, sizeof(status)));
     TEST_ASSERT(status == 0);
     close(status_pipe[0]);
+}
+
+static void test_backend_ipc_payload_transport_parse() {
+    BackendIpcPayloadTransport transport = BackendIpcPayloadTransport::Auto;
+    TEST_ASSERT(parse_backend_ipc_payload_transport("stream", transport));
+    TEST_ASSERT(transport == BackendIpcPayloadTransport::Stream);
+    TEST_ASSERT(parse_backend_ipc_payload_transport("shared", transport));
+    TEST_ASSERT(transport == BackendIpcPayloadTransport::Shared);
+    TEST_ASSERT(parse_backend_ipc_payload_transport("auto", transport));
+    TEST_ASSERT(transport == BackendIpcPayloadTransport::Auto);
+    TEST_ASSERT(!parse_backend_ipc_payload_transport("pipe", transport));
+    TEST_ASSERT(std::strcmp(
+        backend_ipc_payload_transport_name(BackendIpcPayloadTransport::Stream),
+        "stream") == 0);
+}
+
+static void test_backend_ipc_payload_bounds() {
+    size_t out = 0;
+    TEST_ASSERT(backend_ipc_checked_add_size(4, 8, out));
+    TEST_ASSERT(out == 12);
+    TEST_ASSERT(!backend_ipc_checked_add_size(
+        std::numeric_limits<size_t>::max(), 1, out));
+    TEST_ASSERT(backend_ipc_payload_in_bounds(0, 16, 16));
+    TEST_ASSERT(backend_ipc_payload_in_bounds(4, 8, 16));
+    TEST_ASSERT(!backend_ipc_payload_in_bounds(9, 8, 16));
+    TEST_ASSERT(!backend_ipc_payload_in_bounds(
+        std::numeric_limits<size_t>::max(), 1, 16));
+}
+
+static void test_backend_ipc_shared_payload_map_sizing() {
+    size_t map_bytes = 0;
+    TEST_ASSERT(backend_ipc_shared_payload_map_bytes(1024, map_bytes));
+    TEST_ASSERT(map_bytes == 1024 + backend_ipc_shared_payload_header_bytes());
+
+    BackendIpcSharedPayloadHeader header;
+    header.sequence = 7;
+    header.bytes = 1024;
+    TEST_ASSERT(header.sequence == 7);
+    TEST_ASSERT(header.bytes == 1024);
+
+    TEST_ASSERT(!backend_ipc_shared_payload_map_bytes(
+        std::numeric_limits<size_t>::max(), map_bytes));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3270,6 +3381,19 @@ int main() {
     RUN_TEST(test_draft_residency_pflash_auto);
     RUN_TEST(test_draft_residency_dflash_auto_and_request_scoped);
 
+    std::fprintf(stderr, "\n── Backend IPC ──\n");
+    RUN_TEST(test_backend_ipc_rejects_file_work_dir);
+    RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
+    RUN_TEST(test_backend_ipc_payload_transport_parse);
+    RUN_TEST(test_backend_ipc_payload_bounds);
+
+    std::fprintf(stderr, "\n── Backend IPC ──\n");
+    RUN_TEST(test_backend_ipc_rejects_file_work_dir);
+    RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
+    RUN_TEST(test_backend_ipc_payload_transport_parse);
+    RUN_TEST(test_backend_ipc_payload_bounds);
+    RUN_TEST(test_backend_ipc_shared_payload_map_sizing);
+
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
     RUN_TEST(test_jinja_render_basic);
     RUN_TEST(test_jinja_render_no_gen_prompt);
@@ -3282,9 +3406,13 @@ int main() {
 
     std::fprintf(stderr, "\n── Placement config ──\n");
     RUN_TEST(test_parse_target_device_list_same_backend);
-    RUN_TEST(test_parse_target_device_list_rejects_mixed_backend);
+    RUN_TEST(test_parse_target_device_list_mixed_backend);
+    RUN_TEST(test_parse_target_device_list_mixed_backend_multi_remote);
     RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
     RUN_TEST(test_validate_layer_split_weights_shape);
+    RUN_TEST(test_backend_precision_cuda_sm_policy);
+    RUN_TEST(test_backend_precision_hip_arch_policy);
+    RUN_TEST(test_backend_precision_activation_type_combine);
     RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
     RUN_TEST(test_layer_split_backend_sampling_capability_gate);
     RUN_TEST(test_layer_split_backend_chunks_prefill_by_adapter_limit);
@@ -3306,8 +3434,6 @@ int main() {
     RUN_TEST(test_disk_cache_budget_enforcement_scoring);
     RUN_TEST(test_disk_cache_lookup_miss_no_layout);
     RUN_TEST(test_disk_cache_save_below_min_tokens);
-    RUN_TEST(test_backend_ipc_rejects_file_work_dir);
-    RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
 
     std::fprintf(stderr, "\n── Sampler ──\n");
     RUN_TEST(test_sampler_cfg_defaults);
