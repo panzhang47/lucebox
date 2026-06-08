@@ -12,7 +12,8 @@
   <strong>Run a big MoE on a smaller GPU by keeping only the active units lit.</strong><br/>
   Calibrate which experts stay hot from real traffic, swap the rest through a bounded GPU cache.<br/>
   Laguna-XS.2 (3B active / <strong>33B total</strong>) on a single RTX 3090: a 33B-total MoE in <strong>14.6 GiB</strong>,<br/>
-  decoding at <strong>~100 tok/s</strong> with one fused graph, near the <strong>119 tok/s all-GPU ceiling</strong>, vs 66 for naive offload.<br/><br/>
+  decoding at <strong>~100 tok/s</strong> with one fused graph, near the <strong>119 tok/s all-GPU ceiling</strong>, vs 66 for naive offload.<br/>
+  <strong>Qwen3.6 35B-A3B</strong> fits the same way, in <strong>13.3 GiB</strong> (down from ~20.5). One flag, both backends.<br/><br/>
   <a href="https://lucebox.com">lucebox.com</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a>
 </p>
 
@@ -89,6 +90,14 @@ cache to ~0; the single-graph fused decode (`laguna_step_hybrid`, default-on) is
 **bit-identical to all-GPU at full residency** (128/128 tokens, 119 tok/s) and
 holds **~100 tok/s at 60% residency**. Peak VRAM at the operating point (60% hot
 + 32 cache slots) measured at **14.59 GiB**: a 33B-total MoE under 16 GiB.
+
+**Both backends, same idea.** `--spark` works for laguna and qwen35moe alike;
+peak VRAM on the RTX 3090, Q4_K_M:
+
+| Model | All-GPU | Spark | Fits 16 GB |
+|---|---:|---:|:---:|
+| Laguna XS.2 (33B-A3B) | 18.8 GiB | **14.6 GiB** | yes |
+| Qwen3.6 35B-A3B | ~20.5 GiB | **13.3 GiB** | yes |
 
 ## How it works
 
