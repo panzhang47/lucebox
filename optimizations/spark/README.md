@@ -158,6 +158,20 @@ python -m spark.validate ... --budget-pct 60 --hotness spark_profile.csv        
 python -m spark.validate ... --budget-pct 60 --hotness spark_profile.csv --cache-slots 32
 ```
 
+## Reproduce the decode numbers
+
+```
+python -m spark.bench --bin ../../server/build/test_dflash \
+    --gguf laguna-xs2-Q4_K_M.gguf --tok laguna_tok.json \
+    --hotness laguna-xs2-Q4_K_M.gguf.spark.csv --budget-pct 48 --cache-slots 32
+```
+
+Reports steady-state decode tok/s and asserts the single-graph hybrid path is
+token-for-token identical to all-GPU at full residency. On an RTX 3090,
+laguna-xs2 Q4_K_M: all-GPU 119 tok/s, single-graph @100% 118.8 (128/128 exact),
+Spark offload @~60% residency 99 tok/s (83% of all-GPU). This is the same
+`LagunaBackend` decode path that `dflash_server --spark` runs.
+
 Deploy: run the daemon with `DFLASH_EXPERT_BUDGET_PCT=60
 DFLASH_LAGUNA_HOTNESS=spark_profile.csv` and, for the cache,
 `DFLASH_LAGUNA_EXPERT_CACHE=1 DFLASH_LAGUNA_CACHE_SLOTS=32`.
