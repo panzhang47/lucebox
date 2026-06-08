@@ -35,6 +35,8 @@ Each one is self-contained with setup instructions and benchmark notes.
 
 <p align="center">
   <a href="optimizations/pflash/"><img src="assets/cards/pflash_card.png" alt="PFlash speculative prefill" width="46%"></a>
+  &nbsp;&nbsp;
+  <a href="optimizations/spark/"><img src="assets/cards/spark_card.png" alt="Luce Spark MoE expert offload" width="46%"></a>
 </p>
 
 ---
@@ -274,7 +276,7 @@ uv run --directory megakernel python final_bench.py
 
 Local AI should be the default, not a privilege. Private data, no per-token bill, no vendor lock-in. The hardware to run capable models already sits on desks. The software to get real throughput out of it does not.
 
-Nothing was built for local AI inference. Most machines bolt a stock GPU onto a desktop CPU and run a stock runtime, never tuning the kernels to the silicon underneath. On the same 27B model, a DGX Spark or Mac Studio leaves four to six times the real throughput on the table. General-purpose frameworks won the last decade because hand-tuning per chip cost more than it returned: one stack, decent on everything, great on nothing. Speculative decoding, speculative prefill, and fused megakernels turn idle silicon into 3-10× speedups, but they stay locked to BF16 weights on data-center GPUs. Consumer cards inherit the leftovers.
+Nothing was built for local AI inference. Most machines bolt a stock GPU onto a desktop CPU and run a stock runtime, never tuning the kernels to the silicon underneath. On the same 27B model, a DGX Spark or Mac Studio leaves four to six times the real throughput on the table. General-purpose frameworks won the last decade because hand-tuning per chip cost more than it returned: one stack, decent on everything, great on nothing. Speculative decoding, speculative prefill, fused megakernels, and calibrated MoE expert offload turn idle silicon into 3-10× speedups, but they stay locked to BF16 weights on data-center GPUs. Consumer cards inherit the leftovers.
 
 **See the benchmarks and the machine at [lucebox.com](https://lucebox.com).**
 
