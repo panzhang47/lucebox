@@ -985,7 +985,10 @@ bool laguna_step(
     // span, and set_rows K/V append (index is an input, so node properties
     // are bit-identical across decode steps and the captured graph replays).
     const size_t arena_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
-    static std::vector<uint8_t> g_arena;
+    // thread_local: decode is single-threaded per process today (the static
+    // gallocr below makes the same assumption), but a second decode thread
+    // must not share the arena — each thread gets its own stable addresses.
+    static thread_local std::vector<uint8_t> g_arena;
     if (g_arena.size() < arena_size) g_arena.resize(arena_size);
     ggml_init_params ip{};
     ip.mem_size = arena_size;
@@ -1116,7 +1119,10 @@ bool laguna_step_hybrid(
     // what lets the captured CUDA graph replay instead of re-launching ~1.4k
     // kernels per token.
     const size_t arena_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() + 32 * 1024 * 1024;
-    static std::vector<uint8_t> g_arena;
+    // thread_local: decode is single-threaded per process today (the static
+    // gallocr below makes the same assumption), but a second decode thread
+    // must not share the arena — each thread gets its own stable addresses.
+    static thread_local std::vector<uint8_t> g_arena;
     if (g_arena.size() < arena_size) g_arena.resize(arena_size);
     ggml_init_params ip{};
     ip.mem_size = arena_size;

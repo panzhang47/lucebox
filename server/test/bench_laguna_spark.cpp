@@ -12,6 +12,7 @@
 #include "laguna_backend.h"
 #include "dflash27b.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -24,8 +25,8 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "usage: %s <laguna.gguf> [prompt_N=128] [n_gen=256]\n", argv[0]);
         return 2;
     }
-    const int prompt_N = (argc >= 3) ? std::atoi(argv[2]) : 128;
-    const int n_gen    = (argc >= 4) ? std::atoi(argv[3]) : 256;
+    const int prompt_N = std::max(1, (argc >= 3) ? std::atoi(argv[2]) : 128);
+    const int n_gen    = std::max(1, (argc >= 4) ? std::atoi(argv[3]) : 256);
 
     LagunaBackendArgs args;
     args.target_path = argv[1];
