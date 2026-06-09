@@ -167,6 +167,12 @@ jobs:
           GIT_SHA: ${{ steps.identity.outputs.git_sha }}
           IMAGE_TAG: ${{ steps.meta.outputs.version }}
           BUILD_TIME: ${{ steps.identity.outputs.build_time }}
+          # PR builds compile a single arch (sm_86, the RTX 3090 reference) for
+          # fast feedback (~20 min vs ~2 h for the full fat binary) and to stay
+          # under the concurrency group's pre-emption window. Release / main /
+          # dispatch builds keep the full consumer-GPU list so the published
+          # image runs on every supported card.
+          DFLASH_CUDA_ARCHES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;89;90;120' }}
         with:
           files: |
             docker-bake.hcl
