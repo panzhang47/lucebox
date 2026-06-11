@@ -74,16 +74,22 @@ static void test_effective_overflows_full_cache_hit_uses_served_size() {
     TEST_ASSERT(!effective_prompt_overflows(70000, 800, 2048, 65536));
 }
 
-// (c) Genuinely oversized post-compress, no cache hit → reject.
+// (c) Genuinely oversized post-compress, no cache hit (-1 sentinel) → reject.
 static void test_effective_overflows_post_compress_genuinely_oversized() {
     // effective=60000, max_output=10000, max_ctx=65536 → 70000 > 65536 → reject.
-    TEST_ASSERT(effective_prompt_overflows(60000, 0, 10000, 65536));
+    TEST_ASSERT(effective_prompt_overflows(60000, -1, 10000, 65536));
 }
 
 // (d) Verbatim turn-1 within budget → no reject.
 static void test_effective_overflows_verbatim_within_budget() {
     // effective=1000, no cache, max_output=2048, max_ctx=65536 → accept.
-    TEST_ASSERT(!effective_prompt_overflows(1000, 0, 2048, 65536));
+    TEST_ASSERT(!effective_prompt_overflows(1000, -1, 2048, 65536));
+}
+
+// (f) Degenerate zero-length cache hit must be treated as a hit, not as no-hit.
+static void test_effective_overflows_zero_length_hit_is_a_hit() {
+    // served=0 (valid hit), max_output=2048 → 2048 <= 65536 → accept.
+    TEST_ASSERT(!effective_prompt_overflows(70000, 0, 2048, 65536));
 }
 
 // (e) Full-cache hit but served size + max_output itself overflows → reject.
@@ -105,6 +111,7 @@ int main() {
     RUN_TEST(test_effective_overflows_post_compress_genuinely_oversized);
     RUN_TEST(test_effective_overflows_verbatim_within_budget);
     RUN_TEST(test_effective_overflows_full_cache_hit_still_too_large);
+    RUN_TEST(test_effective_overflows_zero_length_hit_is_a_hit);
     std::fprintf(stderr, "\n%d tests, %d failures\n", test_count, test_failures);
     return (test_failures == 0) ? 0 : 1;
 }

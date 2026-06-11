@@ -29,9 +29,9 @@ inline bool effective_prompt_overflows(int effective_tokens,
                                        int max_output,
                                        int max_ctx)
 {
-    // On a pFlash full-cache hit the KV state was built from the compressed form;
-    // budget-check must use that size, not the raw effective_tokens.
-    const int check_tokens = (served_from_cache_tokens > 0)
+    // On a pFlash full-cache hit (sentinel: >=0; -1 = no hit) the KV state was
+    // built from the compressed form; budget-check must use that size.
+    const int check_tokens = (served_from_cache_tokens >= 0)
         ? served_from_cache_tokens
         : effective_tokens;
     return check_tokens + max_output > max_ctx;

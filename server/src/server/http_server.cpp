@@ -1794,8 +1794,8 @@ void HttpServer::worker_loop() {
         // ── PFlash / FlowKV unified gate: FlowKV > WS1 skip > whole-prompt pFlash ──
         std::vector<int32_t> effective_prompt = req.prompt_tokens;
         bool pflash_compressed = false;
-        // Compressed token count served from pFlash full-cache (0 = not a full-cache hit).
-        int pflash_full_cache_served_tokens = 0;
+        // Compressed token count served from pFlash full-cache (-1 = not a full-cache hit).
+        int pflash_full_cache_served_tokens = -1;
 
         if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
             drafter_tokenizer_ != nullptr)
