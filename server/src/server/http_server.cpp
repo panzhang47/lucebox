@@ -1643,11 +1643,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         return true;  // handled (with error)
     }
 
-    // Check context length.
-    // When compression is enabled the effective (post-compress) size is the
-    // real gate; we let oversized requests through so compression can run.
-    // The downstream post-compress guard (after FlowKV/pFlash) enforces the
-    // hard limit on the reduced prompt.
+    // Check context length; oversized + compression_enabled passes through — post-compress check is the real gate.
     {
         const int n_prompt = (int)req.prompt_tokens.size();
         const bool pflash_will_run =
@@ -1797,9 +1793,7 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // ── PFlash / FlowKV unified gate ─────────────────────────────────
-        // Single block; paths are mutually exclusive via should_compress=false.
-        // Priority: FlowKV (continuation + compress flag) > WS1 skip > whole-prompt pFlash.
+        // ── PFlash / FlowKV unified gate: FlowKV > WS1 skip > whole-prompt pFlash ──
         std::vector<int32_t> effective_prompt = req.prompt_tokens;
         bool pflash_compressed = false;
 
@@ -1842,10 +1836,7 @@ void HttpServer::worker_loop() {
                 }
             }
 
-            // FlowKV aged-history compression (req.disk_cache_policy.compress=true).
-            // Triggered by --disk-prefix-cache-compress flag; default false = no-op.
-            // On continuation turns, compresses each aged message once (cached).
-            // messages[0] (system) and the hot tail stay verbatim.
+            // FlowKV: compress aged msgs[1..n-hot_window) once per session; system + hot tail verbatim.
             if (should_compress && is_continuation && req.disk_cache_policy.compress &&
                 req.messages.is_array())
             {
@@ -2031,17 +2022,13 @@ void HttpServer::worker_loop() {
                         n_msgs, hot_window);
                 }
             } else if (should_compress && is_continuation) {
-                // Standard continuation gate (compress flag off).
-                // Warm multi-turn conversations are served by the raw prefix KV cache
-                // (~22x). Compressing poisons the cache (raw SHA1 != compressed SHA1).
+                // Continuation without FlowKV: skip compression to preserve prefix KV cache (~22x).
                 should_compress = false;
                 std::fprintf(stderr,
                     "[pflash] skip-compress (continuation: prior assistant/tool history)\n");
             }
 
-            // WS1: turn-1 verbatim anchor when FlowKV compress flag is on.
-            // Compressing turn-1 keys the snapshot on compressed tokens; turn-2's
-            // verbatim system cannot match that key → cold-poison.
+            // WS1: turn-1 verbatim anchor — compressing would cold-poison turn-2 cache key.
             if (should_compress && !is_continuation && req.disk_cache_policy.compress) {
                 should_compress = false;
                 std::fprintf(stderr,
@@ -2184,10 +2171,7 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // Post-compress effective-size gate.
-        // Applies after FlowKV/pFlash have had a chance to reduce the prompt.
-        // If compression ran but still couldn't bring the effective prompt
-        // within the window, reject cleanly rather than silently overflowing KV.
+        // Post-compress gate: reject if still oversized after FlowKV/pFlash.
         if ((int)effective_prompt.size() + req.max_output > config_.max_ctx) {
             fail_request(400, "effective prompt + max_tokens exceeds context window after compression");
             continue;
@@ -2371,15 +2355,10 @@ void HttpServer::worker_loop() {
         static constexpr int DISK_STAGING_SLOT = ModelBackend::kMaxSlots - 1;
         bool disk_hit = false;
         DiskPrefixCachePolicy disk_policy = req.disk_cache_policy;
-        // system_end: first chat-marker boundary in the effective prompt.
-        // Used as the disk-cache clamp when FlowKV is active so that only the
-        // verbatim system prefix (stable cross-session key) is cached on disk.
+        // system_end: first chat-marker boundary; FlowKV clamps disk cache to verbatim system prefix.
         int system_end = 0;
         if (pflash_compressed && req.disk_cache_policy.compress) {
-            // FlowKV active: disk cache caches [0, system_end) — the verbatim system
-            // prompt, which is a stable cross-session key (never depends on
-            // compressed tokens). #364 Auto/Fixed paths are replaced by a Fixed
-            // boundary at system_end.
+            // FlowKV: cache only [0, system_end) — stable cross-session key, never compressed.
             auto fkv_boundaries =
                 find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
             system_end = fkv_boundaries.empty() ? 0 : fkv_boundaries[0];
@@ -2389,16 +2368,13 @@ void HttpServer::worker_loop() {
                 std::fprintf(stderr,
                     "[flowkv] disk-clamp: boundary clamped to system_end=%d\n", system_end);
             } else {
-                // System prefix too short to cache — disable disk.
                 disk_policy.mode = DiskPrefixCacheMode::Off;
                 std::fprintf(stderr,
                     "[flowkv] disk-clamp: system_end=%d < min=%d — disk off\n",
                     system_end, config_.disk_cache_min_tokens);
             }
         } else if (pflash_compressed) {
-            // Standard whole-prompt PFlash (compress=false): Auto/fixed boundaries
-            // are selected against the uncompressed request stream. Once PFlash
-            // rewrites effective_prompt, only exact full-cache restore is well-defined.
+            // Standard PFlash (compress=false): effective_prompt is rewritten; only Full cache is safe.
             if (disk_policy.mode != DiskPrefixCacheMode::Full) {
                 disk_policy.mode = DiskPrefixCacheMode::Off;
             }
@@ -2807,14 +2783,12 @@ void HttpServer::worker_loop() {
 
         if (!disk_cache_.disabled()) {
             if (!pflash_compressed) {
-                // Standard path: record the verbatim effective_prompt.
                 recent_disk_prompts_.insert(recent_disk_prompts_.begin(), effective_prompt);
             } else if (req.disk_cache_policy.compress) {
-                // FlowKV active: record the verbatim (uncompressed) prompt so that
-                // future Auto boundary lookups see stable verbatim content.
+                // FlowKV: record verbatim prompt so Auto boundary lookups see stable content.
                 recent_disk_prompts_.insert(recent_disk_prompts_.begin(), req.prompt_tokens);
             }
-            // pflash_compressed && !compress (standard PFlash whole-prompt): skip.
+            // pflash_compressed && !compress: skip (effective_prompt is rewritten).
             static constexpr size_t kMaxRecentDiskPrompts = 256;
             if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
                 recent_disk_prompts_.resize(kMaxRecentDiskPrompts);

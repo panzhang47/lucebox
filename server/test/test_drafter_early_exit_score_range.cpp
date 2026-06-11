@@ -1,10 +1,5 @@
-// Unit tests for dflash::common::compute_score_range().
-// Plain int main(), no frameworks.
-//
-// Verifies that SCORE_LAYERS is interpreted relative to fwd_layer_limit
-// (the early-exit boundary) rather than the full model depth, so that
-// early_exit_n=7 + score_layers=7 produces the non-empty range [0,7)
-// instead of the phantom-empty [7,7) the old inline code produced.
+// Unit tests for dflash::common::compute_score_range(). Plain int main(), no frameworks.
+// SCORE_LAYERS is relative to fwd_layer_limit: ee7+sl7 → [0,7), not phantom-empty [7,7).
 
 #include "score_range.h"
 

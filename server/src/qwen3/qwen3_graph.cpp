@@ -250,10 +250,7 @@ bool forward_qwen3_drafter_model(
     }
     running_max.assign((size_t)n_lookahead * S, -INFINITY);
 
-    // Compute score_layer_start early so we can avoid allocating K_norope/Q_norope
-    // for layers that will never be used in scoring.  At S=128K the full K_norope
-    // allocation is ~5.6 GB (21 unused layers × 268 MB) — skipping it keeps total
-    // VRAM under 24 GB and eliminates the warm-path regression (A_compute 5.4x).
+    // Read scoring/early-exit env vars once; compute alloc range before buffers are created.
     static const int score_layers_pre = []() -> int {
         const char * e = std::getenv("PFLASH_DRAFTER_SCORE_LAYERS");
         if (e) { int v = std::atoi(e); if (v > 0) return v; }
@@ -264,23 +261,17 @@ bool forward_qwen3_drafter_model(
         if (e) { int v = std::atoi(e); if (v > 0) return v; }
         return -1;
     }();
-    // fwd_layer_limit_pre mirrors the fwd_layer_limit computed later in the loop.
     const int fwd_layer_limit_pre = (early_exit_pre > 0 && early_exit_pre < w.n_layer)
         ? early_exit_pre : w.n_layer;
-    // Use compute_score_range (same formula as the scoring loop) so the pre-alloc
-    // boundary is guaranteed to match the actual scoring boundary.
     const ScoreRange pre_range = compute_score_range(w.n_layer, score_layers_pre, fwd_layer_limit_pre);
     const int score_layer_start_pre = pre_range.start;
-    // Number of layers that participate in scoring (and need K_norope/Q_norope).
-    const int n_score_layers = pre_range.count();
+    const int n_score_layers = pre_range.count(); // K_norope/Q_norope sized to this, not n_layer
 
     PersBuf hidden_buf, pos_buf, mask_tail_buf, Q_buf, attn_out_buf;
     std::vector<PersBuf> K_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> V_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> Q_last_v((size_t)w.n_layer);
-    // NoPE: only allocate K_norope/Q_norope for layers that will be scored.
-    // When score_layer_start_pre > 0 this trims up to 21 × 268 MB = 5.6 GB,
-    // preventing the VRAM overflow that causes the warm-path regression at 128K.
+    // NoPE: allocate only for scored layers (avoids ~5.6 GB waste at 128K).
     std::vector<PersBuf> K_norope_v(nope_tail ? (size_t)n_score_layers : 0);
     std::vector<PersBuf> Q_norope_v(nope_tail ? (size_t)n_score_layers : 0);
     auto cleanup_all = [&]() {
@@ -380,9 +371,7 @@ bool forward_qwen3_drafter_model(
         ggml_free(gctx);
     }
 
-    // PFLASH_DRAFTER_EARLY_EXIT_N: already read into early_exit_pre above.
-    // Alias used in the forward-loop limit below.
-    const int & early_exit_n = early_exit_pre;
+    const int & early_exit_n = early_exit_pre;  // alias for readability in loop below
 
     // Per-layer A→FA→B loop.
     ggml_gallocr_t galloc = ggml_gallocr_new(
@@ -765,11 +754,7 @@ bool forward_qwen3_drafter_model(
     auto t_fwd_end = std::chrono::steady_clock::now();
     double t_fwd = std::chrono::duration<double>(t_fwd_end - t_total_start).count();
 
-    // Tail attention scoring.
-    // score_layers_pre / compute_score_range already determined the range before
-    // allocation (to size K_norope_v correctly).  Re-use that result here.
-    // score_layer_start_pre == score_layer_start by construction (same formula,
-    // same env vars, same fwd_layer_limit_pre == fwd_layer_limit).
+    // Tail attention scoring; range matches pre-alloc by construction.
     const int score_layer_start  = score_layer_start_pre;
     const int score_layer_end    = fwd_layer_limit;
 

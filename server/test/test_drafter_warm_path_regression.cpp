@@ -1,14 +1,5 @@
-// Regression test: layer-subset warm-path buffer sizing fix.
-//
-// Root cause (commit that introduced fix): when PFLASH_DRAFTER_SCORE_LAYERS=7
-// with a 28-layer model, the old code allocated K_norope_v for ALL 28 layers
-// (~7.5 GB on RTX 3090 at S=128K) even though only 7 layers are read in scoring.
-// The extra 21 × 268 MB = 5.6 GB pushed total VRAM above 24 GB, causing GPU
-// page migration and a 5.4× A_compute regression on warm runs.
-//
-// The fix: size K_norope_v / Q_norope_v to n_score_layers (= score_range.count()),
-// which equals 7 rather than 28.  This test verifies the sizing formula via
-// compute_score_range without needing a GPU.
+// Regression test: K_norope_v/Q_norope_v sized to n_score_layers, not n_layer.
+// Old code allocated 28 entries (~5.6 GB wasted at 128K); fix uses score_range.count().
 
 #include "score_range.h"
 

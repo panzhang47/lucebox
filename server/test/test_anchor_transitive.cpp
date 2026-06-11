@@ -1,10 +1,5 @@
-// TDD: anchor transitive multi-pass.
-//
-// T1 — single-pass query-match preserved (regression pin, PASS today)
-// T2 — single-pass misses chain hops (characterises limitation, PASS today)
-// T3 — transitive rescues all hops (RED until Phase 2)
-//
-// Pure CPU — no GPU, no model load.
+// TDD: anchor transitive multi-pass. Pure CPU — no GPU, no model load.
+// T1: single-pass match; T2: single-pass misses hops; T3: transitive rescues all hops.
 
 #include "../src/qwen3/anchor_scan.h"
 

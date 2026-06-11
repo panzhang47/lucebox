@@ -70,12 +70,11 @@ void scan_and_force_transitive(
     auto pool = initial_query_pool;
     const int n_chunks = (int)forced.size();
 
-    // Precompute token frequencies in body once.
+    // Precompute token frequencies and rare-token position index.
     std::unordered_map<int32_t, int> body_freq;
     body_freq.reserve((size_t)body_end);
     for (int j = 0; j < body_end; ++j) ++body_freq[ids[(size_t)j]];
 
-    // Build inverted index: token -> list of body positions (for rare tokens only).
     std::unordered_map<int32_t, std::vector<int>> rare_positions;
     if (cfg.rare_token_max_freq > 0) {
         for (auto& kv : body_freq) {
@@ -89,29 +88,27 @@ void scan_and_force_transitive(
         }
     }
 
-    // Pass-1: run the initial scan.
+    // Pass-1: initial scan; gate on cascade if enough anchors already found.
     const int count_before_pass1 = count_set(forced);
     scan_and_force(ids, body_end, pool, cfg, forced);
     const int gained_pass1 = count_set(forced) - count_before_pass1;
 
-    // Gating: if pass-1 already found many anchors, skip the cascade entirely.
     if (cfg.cascade_min_anchor_count > 0 && gained_pass1 >= cfg.cascade_min_anchor_count) {
         return;
     }
 
-    // Cascade loop: expand pool with newly-forced tokens and re-scan.
+    // Cascade loop: expand pool with tokens from newly-forced chunks and re-scan.
     std::vector<uint8_t> prev_forced;
     for (int it = 0; it < max_iters; ++it) {
         prev_forced = forced;
 
-        // Rare-token single-match: worklist-driven so cascades within a pass are
-        // caught (e.g. hop3 forces hop2 which forces hop1 in one outer iteration).
+        // Rare-token worklist: catches multi-hop cascades within a single outer iteration.
         if (cfg.rare_token_max_freq > 0) {
             std::vector<int> worklist;
             for (int c = 0; c < n_chunks; ++c) {
                 if (forced[c] && !prev_forced[c]) worklist.push_back(c);
             }
-            // On first iteration, seed from everything forced so far (pass-1 results).
+            // First iteration: seed from all pass-1 results.
             if (it == 0) {
                 worklist.clear();
                 for (int c = 0; c < n_chunks; ++c) {
@@ -137,7 +134,7 @@ void scan_and_force_transitive(
             }
         }
 
-        // Hard cap: if we exceeded max_forced_count, revert this iteration and stop.
+        // Hard cap: revert and stop if exceeded.
         if (count_set(forced) > cfg.max_forced_count) {
             forced = prev_forced;
             break;
@@ -145,7 +142,7 @@ void scan_and_force_transitive(
 
         if (forced == prev_forced) break;
 
-        // Expand pool with tokens from newly-forced chunks (feeds next 4-gram pass).
+        // Expand pool with tokens from newly-forced chunks, then 4-gram re-scan.
         for (int c = 0; c < n_chunks; ++c) {
             if (forced[c] && !prev_forced[c]) {
                 int s = c * cfg.chunk_size;
@@ -154,11 +151,9 @@ void scan_and_force_transitive(
             }
         }
 
-        // 4-gram scan with expanded pool for next iteration.
         prev_forced = forced;
         scan_and_force(ids, body_end, pool, cfg, forced);
 
-        // Hard cap check after 4-gram expansion too.
         if (count_set(forced) > cfg.max_forced_count) {
             forced = prev_forced;
             break;

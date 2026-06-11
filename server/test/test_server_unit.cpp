@@ -3616,9 +3616,7 @@ static void test_prefix_key_stable_across_header_change() {
     TEST_ASSERT(norm_a.find("senior engineer") != std::string::npos);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
 // FlowKV + disk-cache compose tests (T1–T7)
-// ═══════════════════════════════════════════════════════════════════════
 
 // T4 (compress=false): policy name has no "+compress" suffix.
 static void test_flowkv_T4_compress_false_policy_name_no_suffix() {
