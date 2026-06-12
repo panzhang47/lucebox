@@ -346,14 +346,10 @@ uv run --directory megakernel python final_bench.py
 
 Video walkthroughs of each optimization and the harness setup.
 
-| Demo | Video |
-|------|-------|
-| Luce Spark | [YouTube](https://www.youtube.com/watch?v=LB1aVj9lNhg) |
-| Luce DFlash | [YouTube](https://www.youtube.com/watch?v=vbPGvvSB8IQ) |
-| Luce Turboquant | [YouTube](https://www.youtube.com/watch?v=uTOOrfhrnBk) |
-| Luce Harness setup | [YouTube](https://www.youtube.com/watch?v=PysoxVGfvRE) |
-| Luce PFlash | [YouTube](https://www.youtube.com/watch?v=NWeKUL9Bc6Y) |
-| Luce Megakernel | [YouTube](https://www.youtube.com/watch?v=e6jY4goVIu0) |
+|   |   |   |
+|:-:|:-:|:-:|
+| **Luce Spark**<br>[▶ YouTube](https://www.youtube.com/watch?v=LB1aVj9lNhg) | **Luce DFlash**<br>[▶ YouTube](https://www.youtube.com/watch?v=vbPGvvSB8IQ) | **Luce Turboquant**<br>[▶ YouTube](https://www.youtube.com/watch?v=uTOOrfhrnBk) |
+| **Luce Harness setup**<br>[▶ YouTube](https://www.youtube.com/watch?v=PysoxVGfvRE) | **Luce PFlash**<br>[▶ YouTube](https://www.youtube.com/watch?v=NWeKUL9Bc6Y) | **Luce Megakernel**<br>[▶ YouTube](https://www.youtube.com/watch?v=e6jY4goVIu0) |
 
 ---
 
