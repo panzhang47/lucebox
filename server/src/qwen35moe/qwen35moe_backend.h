@@ -22,12 +22,14 @@ public:
     explicit Qwen35MoeBackend(const Qwen35Config & cfg);
     ~Qwen35MoeBackend() override = default;
 
+    bool init() override;
+
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
-    bool supports_dflash_spec_decode() const override { return !target_weights().moe_hybrid; }
+    bool supports_dflash_spec_decode() const override { return true; }
 
     bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
     const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }
@@ -63,7 +65,7 @@ private:
                                 std::string * err);
 
     // Hybrid speculative decode: draft tokens using DFlash draft model,
-    // verify via hybrid forward (layer-by-layer with hot/cold FFN).
+    // verify via hybrid forward (layer-by-layer with hot/MoE expert compute).
     bool do_hybrid_spec_decode(int committed, int n_gen,
                                std::vector<int32_t> & out_tokens,
                                const DaemonIO & io,

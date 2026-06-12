@@ -49,6 +49,7 @@ struct CachedFfnGraph {
     ggml_tensor * valid_lut = nullptr;    // [1,n_expert] F32 1=hot 0=cold
     ggml_tensor * residual_in = nullptr; // [n_embd,1] F32 residual (gpu-remap)
     int n_hot = 0;                      // number of hot experts this graph supports
+    int n_tokens = 1;                   // batched graph token count
 
     bool valid() const { return ctx && gf && alloc && output; }
     void free();
@@ -143,6 +144,7 @@ struct MoeHybridLayerStorage {
     static constexpr int kMaxBatchedCache = 9;  // covers spec sub-batch n_tokens 1..8
     CachedHotBatchedGraph hot_batched_mixed[kMaxBatchedCache];
     CachedHotBatchedGraph cold_batched_mixed[kMaxBatchedCache];
+    CachedHotBatchedGraph shared_batched_graph;
 };
 
 struct MoeHybridStorage {
@@ -208,7 +210,8 @@ bool build_moe_hybrid_storage_from_file(
     const std::vector<LayerExpertFileData> & file_data,
     MoeHybridStorage & out,
     std::string * err = nullptr,
-    int cache_slots = 0);
+    int cache_slots = 0,
+    bool allocate_cold = true);
 
 // Spark: split a VRAM budget into a pinned-hot tier + an auto-sized expert
 // cache ring. target_bytes==0 keeps the current budget (use the card);
