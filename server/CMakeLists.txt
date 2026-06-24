@@ -614,6 +614,11 @@ if(DFLASH27B_TESTS)
         target_include_directories(test_derived_scalars PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         add_test(NAME derived_scalars COMMAND test_derived_scalars)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_placement.cpp")
+        add_executable(test_kvflash_placement test/test_kvflash_placement.cpp)
+        target_include_directories(test_kvflash_placement PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        add_test(NAME kvflash_placement COMMAND test_kvflash_placement)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_bandit_integration.cpp")
         add_executable(test_bandit_integration test/test_bandit_integration.cpp)
         target_include_directories(test_bandit_integration PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -789,6 +794,15 @@ if(DFLASH27B_TESTS)
         # Pure-math unit test (KVFLASH_QK_PURE_ONLY): no ggml, no GPU.
         add_executable(test_kvflash_qk test/test_kvflash_qk.cpp)
         target_include_directories(test_kvflash_qk PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_pool_sizing.cpp")
+        # Pure unit test for kvflash_pool_from_env: ggml headers only, no ggml link, no GPU.
+        add_executable(test_kvflash_pool_sizing test/test_kvflash_pool_sizing.cpp)
+        target_include_directories(test_kvflash_pool_sizing PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        add_test(NAME kvflash_pool_sizing COMMAND test_kvflash_pool_sizing)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_restore_delta.cpp")
         add_executable(test_restore_delta test/test_restore_delta.cpp)
