@@ -1160,8 +1160,6 @@ static bool eval_moe_hybrid_ffn_batched_core(
     // path below.
     if (n_tokens > 0 && n_tokens < MoeHybridLayerStorage::kMaxBatchedCache) {
         const int total_slots = n_used * n_tokens;
-        const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
-                              : storage.gate_hot    ? (int)storage.gate_hot->ne[2] : 1;
         const int n_cold_stack = std::max(1, (int)(storage.down_cold ? storage.down_cold->ne[2] : 1));
         std::vector<int32_t> hot_sel(total_slots);
         std::vector<float>   hot_wts(total_slots, 0.0f);
@@ -1232,9 +1230,6 @@ static bool eval_moe_hybrid_ffn_batched_core(
     // Dummy slots use weight 0.0 and are distributed evenly across all experts
     // to avoid pathological routing imbalance that triggers OOB in MMQ stream-k.
     const int total_slots = n_used * n_tokens;
-    const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
-                          : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
-                          : 1;
     std::vector<int32_t> hot_sel(total_slots);
     // Dummy slots -> pinned (initialized) experts only; see note above.
     const int n_hot_init = std::max(1, storage.hot_active);

@@ -6,6 +6,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
+
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace dflash::common {
 
@@ -32,6 +38,55 @@ int parse_nonnegative_env(const char * name, int fallback) {
         return fallback;
     }
     return (int)value;
+}
+
+std::string make_runtime_key(const MoeExpertComputeRuntimeConfig & cfg) {
+    std::string key = cfg.target_path;
+    key += "|n_layer=" + std::to_string(cfg.n_layer);
+    key += "|n_expert=" + std::to_string(cfg.n_expert);
+    key += "|n_used=" + std::to_string(cfg.n_expert_used);
+    key += "|n_embd=" + std::to_string(cfg.n_embd);
+    key += "|n_ff=" + std::to_string(cfg.n_ff_exp);
+    if (const char * ipc_bin = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN")) {
+        key += "|ipc_bin=";
+        key += ipc_bin;
+        key += "|ipc_gpu=" + std::to_string(
+            parse_nonnegative_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU", 0));
+        key += "|ipc_work=";
+        if (const char * work_dir = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_WORK_DIR")) {
+            key += work_dir;
+        }
+        key += "|ipc_required=" + std::to_string(
+            parse_nonnegative_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_REQUIRED", 0));
+    } else {
+        key += "|cpu";
+    }
+    return key;
+}
+
+bool validate_executable_file(const char * path, std::string * err) {
+#if defined(_WIN32)
+    (void)path;
+    (void)err;
+    return true;
+#else
+    struct stat st {};
+    if (::stat(path, &st) != 0) {
+        if (err) *err = std::string("MoE expert compute IPC binary is not accessible: ") +
+                        path + ": " + std::strerror(errno);
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        if (err) *err = std::string("MoE expert compute IPC binary is not a regular file: ") + path;
+        return false;
+    }
+    if (::access(path, X_OK) != 0) {
+        if (err) *err = std::string("MoE expert compute IPC binary is not executable: ") +
+                        path + ": " + std::strerror(errno);
+        return false;
+    }
+    return true;
+#endif
 }
 
 }  // namespace
@@ -99,6 +154,7 @@ void MoeExpertComputeRuntime::reset() {
     compute.reset();
     layers.clear();
     target_path.clear();
+    runtime_key.clear();
     placement_fingerprint = 0;
 }
 
@@ -122,19 +178,27 @@ bool ensure_moe_expert_compute_runtime(
     const uint64_t fingerprint =
         moe_expert_placement_fingerprint(hybrid, cfg.n_layer, cfg.n_expert,
                                          cfg.n_expert_used);
+    const std::string runtime_key = make_runtime_key(cfg);
     const bool can_reuse =
         runtime.compute &&
         runtime.compute->healthy() &&
-        runtime.target_path == cfg.target_path &&
+        runtime.runtime_key == runtime_key &&
         runtime.placement_fingerprint == fingerprint;
     if (!can_reuse) {
         runtime.compute.reset();
         runtime.target_path.clear();
+        runtime.runtime_key.clear();
         runtime.placement_fingerprint = 0;
     }
 
     if (!runtime.compute) {
         if (const char * ipc_bin = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN")) {
+            if (!validate_executable_file(ipc_bin, err)) {
+                std::fprintf(stderr, "%s %s\n", cfg.log_prefix ? cfg.log_prefix : "[moe-expert-compute]",
+                             err ? err->c_str() : "invalid remote IPC binary");
+                runtime.reset();
+                return false;
+            }
             const char * work_dir = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_WORK_DIR");
             const int remote_gpu =
                 parse_nonnegative_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU", 0);
@@ -160,6 +224,7 @@ bool ensure_moe_expert_compute_runtime(
 
     runtime.layers = make_moe_expert_layers(hybrid, layer_descs);
     runtime.target_path = cfg.target_path;
+    runtime.runtime_key = runtime_key;
     runtime.placement_fingerprint = fingerprint;
     return true;
 }

@@ -607,6 +607,12 @@ bool load_target_gguf_partial(const std::string & path,
         alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
         allocs.push_back(a);
     }
+    auto release_out_buffer = [&]() {
+        if (out.buf) {
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+        }
+    };
     if (plan.metadata_only) {
         out.buf = nullptr;
     } else if (allocs.empty()) {
@@ -626,10 +632,45 @@ bool load_target_gguf_partial(const std::string & path,
         for (const TargetTensorAlloc & a : allocs) {
             if (ggml_backend_tensor_alloc(out.buf, a.tensor, base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
                 set_last_error("ggml_backend_tensor_alloc failed (target)");
+                release_out_buffer();
                 gguf_free(gctx);
                 return false;
             }
         }
+    }
+
+    const size_t data_start = gguf_get_data_offset(gctx);
+
+    if (plan.metadata_only) {
+#if !defined(_WIN32)
+        struct stat st {};
+        if (::stat(path.c_str(), &st) != 0 || st.st_size < 0) {
+            set_last_error(std::string("stat failed for metadata-only target load: ") + std::strerror(errno));
+            gguf_free(gctx);
+            return false;
+        }
+        const size_t file_len = (size_t)st.st_size;
+#endif
+        for (int64_t tid = 0; tid < n_tensors; tid++) {
+            const char * tname = gguf_get_tensor_name(gctx, tid);
+            ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+            if (!t) continue;
+            const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+            const size_t sz  = gguf_get_tensor_size(gctx, tid);
+            if (off < data_start || off + sz < off
+#if !defined(_WIN32)
+                || off + sz > file_len
+#endif
+            ) {
+                set_last_error(std::string("tensor '") + tname + "' has invalid file range");
+                gguf_free(gctx);
+                return false;
+            }
+        }
+        gguf_free(gctx);
+        std::printf("[loader] target metadata-only load: layers=[%d,%d) output=%d tensors=%zu\n",
+                    plan.layer_begin, plan.layer_end, (int)plan.load_output, allocs.size());
+        return true;
     }
 
     // ── 4. mmap the file and copy tensor bytes to CUDA ────────────────
@@ -638,8 +679,12 @@ bool load_target_gguf_partial(const std::string & path,
     // lookup (CUDA get_rows doesn't support k-quants). We hand the mmap
     // ownership to TargetWeights::embedder at the end.
     Mmap mm;
-    if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
-    const size_t data_start = gguf_get_data_offset(gctx);
+    if (!mm.open_ro(path, err)) {
+        set_last_error(err);
+        release_out_buffer();
+        gguf_free(gctx);
+        return false;
+    }
 
     size_t total = 0;
     size_t tok_embd_off = 0, tok_embd_sz = 0;
@@ -652,6 +697,7 @@ bool load_target_gguf_partial(const std::string & path,
         const size_t sz  = gguf_get_tensor_size(gctx, tid);
         if (off + sz > mm.len) {
             set_last_error(std::string("tensor '") + tname + "' overflows file");
+            release_out_buffer();
             gguf_free(gctx);
             return false;
         }
@@ -665,10 +711,8 @@ bool load_target_gguf_partial(const std::string & path,
         if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
             continue;
         }
-        if (!plan.metadata_only) {
-            ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
-            total += sz;
-        }
+        ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
+        total += sz;
     }
 
     // ── 4b. Read NVFP4 per-tensor weight scales (optional; 1.0 for non-NVFP4).
@@ -763,19 +807,15 @@ bool load_target_gguf_partial(const std::string & path,
                     exp_q_dim, exp_kv_dim, exp_n_embd,
                     tag, err)) {
                 set_last_error(err);
+                release_out_buffer();
                 return false;
             }
         }
     }
 
-    if (plan.metadata_only) {
-        std::printf("[loader] target metadata-only load: layers=[%d,%d) output=%d tensors=%zu\n",
-                    plan.layer_begin, plan.layer_end, (int)plan.load_output, allocs.size());
-        return true;
-    }
-
     if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");
+        release_out_buffer();
         return false;
     }
 
@@ -783,6 +823,7 @@ bool load_target_gguf_partial(const std::string & path,
     //       entire GGUF mmap resident just for CPU embedding lookup.
     if (out.n_vocab <= 0) {
         set_last_error("invalid n_vocab in GGUF metadata (token embedder cannot be sized)");
+        release_out_buffer();
         return false;
     }
     out.embedder.tok_embd_owned.resize(tok_embd_sz);

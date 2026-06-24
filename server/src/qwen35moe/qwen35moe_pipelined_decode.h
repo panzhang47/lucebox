@@ -82,8 +82,8 @@ struct PipelinedDecodeTelemetry {
     uint64_t gpu_idle_us = 0;       // total GPU idle (tensor_io + combine_overhead + sync_wait)
     uint64_t tensor_io_us = 0;      // hot path setup: D2H readback + GPU copies + kernel launch
     uint64_t combine_overhead_us = 0; // combine graph dispatch + copy
-    uint64_t cold_cpu_us = 0;       // cold path total (graph build + ggml CPU compute)
-    uint64_t expert_compute_us = 0;   // just ggml_backend_graph_compute(cpu_be) time
+    uint64_t cold_cpu_us = 0;       // non-local expert path total (CPU or remote expert compute)
+    uint64_t expert_compute_us = 0; // non-local expert compute call time, excluding combine
     uint64_t hot_graph_build_us = 0; // hot graph rebuild (only when n_hot changes)
     uint64_t ffn_post_get_us = 0;   // D2H readback of ffn_post for cold path
     uint64_t sync_wait_us = 0;      // time in ggml_backend_synchronize (waiting for GPU)

@@ -118,6 +118,7 @@ struct MoeExpertComputeRuntime {
     std::unique_ptr<MoeExpertCompute> compute;
     std::vector<MoeExpertLayer> layers;
     std::string target_path;
+    std::string runtime_key;
     uint64_t placement_fingerprint = 0;
 
     void reset();

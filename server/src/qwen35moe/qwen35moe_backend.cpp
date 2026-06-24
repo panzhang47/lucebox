@@ -1548,6 +1548,7 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
     if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
                                     target_cache(), *target_weights().moe_hybrid,
                                     kv_pos, cfg_.kq_stride_pad, nullptr,
+                                    /*kv_slot=*/-1,
                                     /*capture_layers=*/true,
                                     routing_stats_.get())) {
         return false;
