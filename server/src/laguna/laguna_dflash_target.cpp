@@ -67,6 +67,22 @@ bool laguna_extract_logits_topk(ggml_tensor * logits,
     return true;
 }
 
+bool laguna_dflash_tensor_set_checked(const char * label,
+                                      ggml_tensor * t,
+                                      const void * data,
+                                      size_t offset,
+                                      size_t size,
+                                      bool required = true) {
+    if (!t || !t->buffer) {
+        if (required) {
+            std::fprintf(stderr, "[laguna-dflash] input tensor not allocated: %s\n", label);
+        }
+        return !required;
+    }
+    ggml_backend_tensor_set(t, data, offset, size);
+    return true;
+}
+
 }  // namespace
 
 LagunaDFlashTarget::LagunaDFlashTarget(
@@ -390,35 +406,51 @@ bool LagunaDFlashTarget::verify_tree(
             std::fprintf(stderr, "laguna_verify_tree: embed failed\n");
             return false;
         }
-        ggml_backend_tensor_set(cached.inp_embed, embed.data(), 0,
-                                ggml_nbytes(cached.inp_embed));
+        if (!laguna_dflash_tensor_set_checked("verify_tree_cached.ie", cached.inp_embed,
+                                              embed.data(), 0,
+                                              ggml_nbytes(cached.inp_embed))) {
+            return false;
+        }
 
         std::fill(cached.pos.begin(), cached.pos.end(), 0);
         cached.pos[0] = committed;
         for (int i = 1; i < N_actual; ++i) {
             cached.pos[(size_t)i] = committed + tree.depths[(size_t)i - 1];
         }
-        ggml_backend_tensor_set(cached.positions, cached.pos.data(), 0,
-                                ggml_nbytes(cached.positions));
+        if (!laguna_dflash_tensor_set_checked("verify_tree_cached.positions", cached.positions,
+                                              cached.pos.data(), 0,
+                                              ggml_nbytes(cached.positions))) {
+            return false;
+        }
 
         for (int i = 0; i < N; ++i) cached.rows[(size_t)i] = committed + i;
-        ggml_backend_tensor_set(cached.kv_idx, cached.rows.data(), 0,
-                                ggml_nbytes(cached.kv_idx));
+        if (!laguna_dflash_tensor_set_checked("verify_tree_cached.kv_idx", cached.kv_idx,
+                                              cached.rows.data(), 0,
+                                              ggml_nbytes(cached.kv_idx))) {
+            return false;
+        }
 
         std::fill(cached.parents.begin(), cached.parents.end(), -1);
         cached.parents[0] = -1;
         for (int i = 1; i < N_actual; ++i) {
             cached.parents[(size_t)i] = tree.parents[(size_t)i];
         }
-        ggml_backend_tensor_set(cached.parent_ids, cached.parents.data(), 0,
-                                ggml_nbytes(cached.parent_ids));
+        if (!laguna_dflash_tensor_set_checked("verify_tree_cached.parent_ids", cached.parent_ids,
+                                              cached.parents.data(), 0,
+                                              ggml_nbytes(cached.parent_ids), false)) {
+            return false;
+        }
 
         if (cached.feat_rows) {
             for (int i = 0; i < N; ++i) {
                 cached.feat_idx[(size_t)i] = (committed + i) % cache_.target_feat_cap;
             }
-            ggml_backend_tensor_set(cached.feat_rows, cached.feat_idx.data(), 0,
-                                    ggml_nbytes(cached.feat_rows));
+            if (!laguna_dflash_tensor_set_checked("verify_tree_cached.feat_rows",
+                                                  cached.feat_rows,
+                                                  cached.feat_idx.data(), 0,
+                                                  ggml_nbytes(cached.feat_rows), false)) {
+                return false;
+            }
         }
 
         std::fill(cached.full_mask.begin(), cached.full_mask.end(), -INFINITY);
@@ -448,10 +480,14 @@ bool LagunaDFlashTarget::verify_tree(
                 }
             }
         }
-        ggml_backend_tensor_set(cached.mask_full, cached.full_mask.data(), 0,
-                                ggml_nbytes(cached.mask_full));
-        ggml_backend_tensor_set(cached.mask_swa, cached.swa_mask.data(), 0,
-                                ggml_nbytes(cached.mask_swa));
+        if (!laguna_dflash_tensor_set_checked("verify_tree_cached.mask_full", cached.mask_full,
+                                              cached.full_mask.data(), 0,
+                                              ggml_nbytes(cached.mask_full)) ||
+            !laguna_dflash_tensor_set_checked("verify_tree_cached.mask_swa", cached.mask_swa,
+                                              cached.swa_mask.data(), 0,
+                                              ggml_nbytes(cached.mask_swa))) {
+            return false;
+        }
 
         if (ggml_backend_graph_compute(backend_, cached.gf) != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "laguna_verify_tree: cached graph_compute failed\n");
@@ -546,32 +582,50 @@ bool LagunaDFlashTarget::verify_tree(
         ggml_free(ctx);
         return false;
     }
-    ggml_backend_tensor_set(ie, embed.data(), 0, ggml_nbytes(ie));
+    if (!laguna_dflash_tensor_set_checked("verify_tree.ie", ie, embed.data(), 0, ggml_nbytes(ie))) {
+        ggml_free(ctx);
+        return false;
+    }
 
     std::vector<int32_t> pos((size_t)N, 0);
     pos[0] = committed;
     for (int i = 1; i < N_actual; ++i) {
         pos[(size_t)i] = committed + tree.depths[(size_t)i - 1];
     }
-    ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
+    if (!laguna_dflash_tensor_set_checked("verify_tree.positions", pp, pos.data(), 0, ggml_nbytes(pp))) {
+        ggml_free(ctx);
+        return false;
+    }
 
     std::vector<int32_t> rows((size_t)N);
     for (int i = 0; i < N; ++i) rows[(size_t)i] = committed + i;
-    ggml_backend_tensor_set(kvi, rows.data(), 0, ggml_nbytes(kvi));
+    if (!laguna_dflash_tensor_set_checked("verify_tree.kv_idx", kvi, rows.data(), 0, ggml_nbytes(kvi))) {
+        ggml_free(ctx);
+        return false;
+    }
 
     std::vector<int32_t> parents((size_t)N, -1);
     parents[0] = -1;
     for (int i = 1; i < N_actual; ++i) {
         parents[(size_t)i] = tree.parents[(size_t)i];
     }
-    ggml_backend_tensor_set(parent_ids, parents.data(), 0, ggml_nbytes(parent_ids));
+    if (!laguna_dflash_tensor_set_checked("verify_tree.parent_ids", parent_ids, parents.data(), 0,
+                                          ggml_nbytes(parent_ids), false)) {
+        ggml_free(ctx);
+        return false;
+    }
 
     if (feat_rows) {
         std::vector<int32_t> feat_idx((size_t)N);
         for (int i = 0; i < N; ++i) {
             feat_idx[(size_t)i] = (committed + i) % cache_.target_feat_cap;
         }
-        ggml_backend_tensor_set(feat_rows, feat_idx.data(), 0, ggml_nbytes(feat_rows));
+        if (!laguna_dflash_tensor_set_checked("verify_tree.feat_rows", feat_rows,
+                                              feat_idx.data(), 0,
+                                              ggml_nbytes(feat_rows), false)) {
+            ggml_free(ctx);
+            return false;
+        }
     }
 
     std::vector<float> mfull((size_t)mk_w * (size_t)N, -INFINITY);
@@ -601,8 +655,13 @@ bool LagunaDFlashTarget::verify_tree(
             }
         }
     }
-    ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
-    ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
+    if (!laguna_dflash_tensor_set_checked("verify_tree.mask_full", mk_full, mfull.data(), 0,
+                                          ggml_nbytes(mk_full)) ||
+        !laguna_dflash_tensor_set_checked("verify_tree.mask_swa", mk_swa, mswa.data(), 0,
+                                          ggml_nbytes(mk_swa))) {
+        ggml_free(ctx);
+        return false;
+    }
 
     if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "laguna_verify_tree: graph_compute failed\n");
@@ -735,8 +794,13 @@ bool LagunaDFlashTarget::rollback_to_tree(
                 committed + d;
         }
     }
-    ggml_backend_tensor_set(src_rows_kv, src_kv.data(), 0, ggml_nbytes(src_rows_kv));
-    ggml_backend_tensor_set(dst_rows_kv, dst_kv.data(), 0, ggml_nbytes(dst_rows_kv));
+    if (!laguna_dflash_tensor_set_checked("rollback_tree.src_rows_kv", src_rows_kv,
+                                          src_kv.data(), 0, ggml_nbytes(src_rows_kv)) ||
+        !laguna_dflash_tensor_set_checked("rollback_tree.dst_rows_kv", dst_rows_kv,
+                                          dst_kv.data(), 0, ggml_nbytes(dst_rows_kv))) {
+        ggml_free(ctx);
+        return false;
+    }
 
     if (src_rows_feat && dst_rows_feat) {
         const int cap = cache_.target_feat_cap;
@@ -746,10 +810,15 @@ bool LagunaDFlashTarget::rollback_to_tree(
             src_feat[(size_t)d] = (committed + accepted_dfs[(size_t)d]) % cap;
             dst_feat[(size_t)d] = (committed + d) % cap;
         }
-        ggml_backend_tensor_set(src_rows_feat, src_feat.data(), 0,
-                                ggml_nbytes(src_rows_feat));
-        ggml_backend_tensor_set(dst_rows_feat, dst_feat.data(), 0,
-                                ggml_nbytes(dst_rows_feat));
+        if (!laguna_dflash_tensor_set_checked("rollback_tree.src_rows_feat", src_rows_feat,
+                                              src_feat.data(), 0,
+                                              ggml_nbytes(src_rows_feat), false) ||
+            !laguna_dflash_tensor_set_checked("rollback_tree.dst_rows_feat", dst_rows_feat,
+                                              dst_feat.data(), 0,
+                                              ggml_nbytes(dst_rows_feat), false)) {
+            ggml_free(ctx);
+            return false;
+        }
     }
 
     if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
@@ -868,8 +937,12 @@ bool LagunaDFlashTarget::project_hidden_to_logits(
         return false;
     }
 
-    ggml_backend_tensor_set(inp, hidden, 0,
-                            sizeof(float) * (size_t)n_tokens * (size_t)w_.n_embd);
+    if (!laguna_dflash_tensor_set_checked("project_hidden_to_logits.inp", inp,
+                                          hidden, 0,
+                                          sizeof(float) * (size_t)n_tokens * (size_t)w_.n_embd)) {
+        ggml_free(ctx);
+        return false;
+    }
     if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "laguna_project_hidden_to_logits: graph_compute failed\n");
         ggml_free(ctx);
@@ -975,8 +1048,12 @@ bool LagunaDFlashTarget::project_hidden_to_topk(
         return false;
     }
 
-    ggml_backend_tensor_set(inp, hidden, 0,
-                            sizeof(float) * (size_t)n_tokens * (size_t)w_.n_embd);
+    if (!laguna_dflash_tensor_set_checked("project_hidden_to_topk.inp", inp,
+                                          hidden, 0,
+                                          sizeof(float) * (size_t)n_tokens * (size_t)w_.n_embd)) {
+        ggml_free(ctx);
+        return false;
+    }
     if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "laguna_project_hidden_to_topk: graph_compute failed\n");
         ggml_free(ctx);
