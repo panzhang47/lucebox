@@ -741,11 +741,26 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                     "(rank=%d vocab=%d confidence_dim=%d)\n",
                     dw.dspark.markov_rank, dw.dspark.vocab_size, dw.dspark.confidence_dim);
             }
-            if (dspark_markov_correct_greedy_chain(dw, draft_backend_, *target,
+            static const bool fused_dspark = []() {
+                const char * e = std::getenv("DFLASH_LAGUNA_FUSED_DSPARK");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            bool ds_ok = false;
+            if (fused_dspark && laguna_dspark_confidence_threshold() <= 0.0f) {
+                // One graph on the draft stream: lm_head + markov chain +
+                // in-graph argmax; no host logits round-trip.
+                ds_ok = dspark_markov_correct_greedy_chain_fused(
+                    dw, draft_backend_, target->lm_head_tensor(),
+                    local_hidden.data(), q_len, last_tok, draft_tok);
+            }
+            if (!ds_ok) {
+                ds_ok = dspark_markov_correct_greedy_chain(dw, draft_backend_, *target,
                                                    local_hidden.data(), q_len,
                                                    last_tok,
                                                    laguna_dspark_confidence_threshold(),
-                                                   draft_tok)) {
+                                                   draft_tok);
+            }
+            if (ds_ok) {
                 used_dspark = true;
                 q_len = (int)draft_tok.size();
                 target_tok.resize((size_t)q_len);
@@ -782,7 +797,25 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             const int K = (args_.ddtree_budget > L) ? 8 : 1;
             std::vector<float> top_lp;
             std::vector<int32_t> top_ids;
-            if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+            static const bool dspark_tree = []() {
+                const char * e = std::getenv("DFLASH_LAGUNA_DSPARK_TREE");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            bool topk_ok = false;
+            if (dspark_tree && laguna_dspark_enabled() && dw.dspark.enabled) {
+                static std::atomic<bool> s_dstree_logged{false};
+                if (!s_dstree_logged.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[laguna-spec] DSpark Markov head active for DDTree candidates\n");
+                }
+                topk_ok = dspark_markov_project_topk(dw, draft_backend_,
+                                                     target->lm_head_tensor(),
+                                                     local_hidden.data(), q_len, K,
+                                                     args_.ddtree_temp, last_tok,
+                                                     top_lp, top_ids);
+            }
+            if (!topk_ok &&
+                !target->project_hidden_to_topk(local_hidden.data(), q_len, K,
                                                 args_.ddtree_temp, top_lp, top_ids)) {
                 std::fprintf(stderr, "[laguna-spec] ddtree topk projection failed\n");
                 step_graph_destroy(draft_sg);
