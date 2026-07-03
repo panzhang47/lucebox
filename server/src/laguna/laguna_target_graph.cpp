@@ -1203,6 +1203,31 @@ LagunaGraphOutputs build_laguna_graph(
 
 // ---- Public turnkey forward step ----------------------------------------
 //
+// Pinned host staging for per-step graph inputs. ggml_backend_tensor_set from
+// pageable memory costs a staged DMA plus a stream synchronize PER CALL, and
+// the decode/verify hot loops issue ~5 uploads per step - those syncs, not
+// kernels, dominated step wall time. Staging in pinned memory and uploading
+// with tensor_set_async on the backend stream leaves the single sync inside
+// ggml_backend_graph_compute() as the only per-step synchronization.
+static uint8_t * laguna_host_stage(ggml_backend_t backend,
+                                   ggml_backend_buffer_t & buf,
+                                   size_t need) {
+    if (buf && ggml_backend_buffer_get_size(buf) >= need) {
+        return (uint8_t *) ggml_backend_buffer_get_base(buf);
+    }
+    if (buf) {
+        ggml_backend_buffer_free(buf);
+        buf = nullptr;
+    }
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (ggml_backend_dev_t dev = ggml_backend_get_device(backend)) {
+        buft = ggml_backend_dev_host_buffer_type(dev);
+    }
+    if (!buft) return nullptr;
+    buf = ggml_backend_buft_alloc_buffer(buft, need);
+    return buf ? (uint8_t *) ggml_backend_buffer_get_base(buf) : nullptr;
+}
+
 // Wires the FULL + SWA causal masks, runs the backend graph, and returns
 // last-token logits and/or a GPU-computed argmax on the host. Updates
 // cache.cur_pos. The common greedy decode path reuses a per-thread graph while
@@ -1260,9 +1285,11 @@ bool laguna_step(
             ggml_tensor * argmax = nullptr;
             std::vector<float> full_mask;
             std::vector<float> swa_mask;
+            ggml_backend_buffer_t stage_buf = nullptr;
 
             void clear() {
                 if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
+                if (stage_buf) { ggml_backend_buffer_free(stage_buf); stage_buf = nullptr; }
                 if (ctx) { ggml_free(ctx); ctx = nullptr; }
                 gf = nullptr;
                 inp_embed = positions = kv_idx = mask_full = mask_swa = argmax = nullptr;
@@ -1340,24 +1367,36 @@ bool laguna_step(
             cached.swa_mask.resize((size_t)mk_w);
         }
 
-        ggml_backend_tensor_set(cached.inp_embed, embed, 0, ggml_nbytes(cached.inp_embed));
-        int32_t pos_val = kv_start;
-        ggml_backend_tensor_set(cached.positions, &pos_val, 0, sizeof(pos_val));
-        ggml_backend_tensor_set(cached.kv_idx, &pos_val, 0, sizeof(pos_val));
-
-        std::fill(cached.full_mask.begin(), cached.full_mask.end(), -INFINITY);
-        for (int k = 0; k <= kv_start && k < kv_len && k < mk_w; ++k) {
-            cached.full_mask[(size_t)k] = 0.0f;
+        const size_t embed_sz = ggml_nbytes(cached.inp_embed);
+        const size_t mask_sz  = (size_t)mk_w * sizeof(float);
+        uint8_t * st = laguna_host_stage(backend, cached.stage_buf,
+                                         embed_sz + sizeof(int32_t) + 2 * mask_sz);
+        if (!st) {
+            std::fprintf(stderr, "laguna_step: host stage alloc failed\n");
+            return false;
         }
-        ggml_backend_tensor_set(cached.mask_full, cached.full_mask.data(), 0, ggml_nbytes(cached.mask_full));
+        float   * st_embed = (float *)   st;
+        int32_t * st_pos   = (int32_t *) (st + embed_sz);
+        float   * st_mfull = (float *)   (st + embed_sz + sizeof(int32_t));
+        float   * st_mswa  = (float *)   (st + embed_sz + sizeof(int32_t) + mask_sz);
 
-        std::fill(cached.swa_mask.begin(), cached.swa_mask.end(), -INFINITY);
+        std::memcpy(st_embed, embed, embed_sz);
+        *st_pos = kv_start;
+        std::fill(st_mfull, st_mfull + mk_w, -INFINITY);
+        for (int k = 0; k <= kv_start && k < kv_len && k < mk_w; ++k) {
+            st_mfull[(size_t)k] = 0.0f;
+        }
         const int W = w.sliding_window;
         const int win_lo = std::max(0, kv_start - W + 1);
+        std::fill(st_mswa, st_mswa + mk_w, -INFINITY);
         for (int k = win_lo; k <= kv_start && k < kv_len && k < mk_w; ++k) {
-            cached.swa_mask[(size_t)k] = 0.0f;
+            st_mswa[(size_t)k] = 0.0f;
         }
-        ggml_backend_tensor_set(cached.mask_swa, cached.swa_mask.data(), 0, ggml_nbytes(cached.mask_swa));
+        ggml_backend_tensor_set_async(backend, cached.inp_embed, st_embed, 0, embed_sz);
+        ggml_backend_tensor_set_async(backend, cached.positions, st_pos, 0, sizeof(int32_t));
+        ggml_backend_tensor_set_async(backend, cached.kv_idx,    st_pos, 0, sizeof(int32_t));
+        ggml_backend_tensor_set_async(backend, cached.mask_full, st_mfull, 0, mask_sz);
+        ggml_backend_tensor_set_async(backend, cached.mask_swa,  st_mswa,  0, mask_sz);
 
         if (ggml_backend_graph_compute(backend, cached.gf) != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "laguna_step: cached graph_compute failed\n");
@@ -1568,6 +1607,7 @@ bool laguna_verify_batch(
         ggml_backend_t              backend_id = nullptr;
         const LagunaTargetWeights * w_id = nullptr;
         const LagunaTargetCache *   cache_id = nullptr;
+        ggml_backend_buffer_t       stage_buf = nullptr;
     };
     static thread_local VerifySlot g_slot_block, g_slot_bonus;
     VerifySlot & S = (n_tokens == 1) ? g_slot_bonus : g_slot_block;
@@ -1641,6 +1681,7 @@ bool laguna_verify_batch(
         if (S.galloc && S.backend_id != backend) {
             ggml_gallocr_free(S.galloc);
             S.galloc = nullptr;
+            if (S.stage_buf) { ggml_backend_buffer_free(S.stage_buf); S.stage_buf = nullptr; }
         }
         if (!S.galloc) S.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         if (!ggml_gallocr_alloc_graph(S.galloc, gf)) {
@@ -1666,16 +1707,31 @@ bool laguna_verify_batch(
     ggml_tensor * feat_rows = S.feat_rows;
     ggml_tensor * argmax = S.argmax;
 
-    ggml_backend_tensor_set(ie, embed, 0, ggml_nbytes(ie));
-    std::vector<int32_t> pos((size_t)n_tokens);
-    for (int i = 0; i < n_tokens; ++i) pos[(size_t)i] = kv_start + i;
-    ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
+    const size_t embed_sz = ggml_nbytes(ie);
+    const size_t pos_sz   = (size_t)n_tokens * sizeof(int32_t);
+    const size_t mask_sz  = (size_t)mk_w * n_tokens * sizeof(float);
+    uint8_t * st = laguna_host_stage(backend, S.stage_buf,
+                                     embed_sz + 3 * pos_sz + 2 * mask_sz);
+    if (!st) {
+        std::fprintf(stderr, "laguna_verify_batch: host stage alloc failed\n");
+        return false;
+    }
+    float   * st_embed = (float *)   st;
+    int32_t * st_pos   = (int32_t *) (st + embed_sz);
+    int32_t * st_kvi   = (int32_t *) (st + embed_sz + pos_sz);
+    int32_t * st_feat  = (int32_t *) (st + embed_sz + 2 * pos_sz);
+    float   * st_mfull = (float *)   (st + embed_sz + 3 * pos_sz);
+    float   * st_mswa  = (float *)   (st + embed_sz + 3 * pos_sz + mask_sz);
+
+    std::memcpy(st_embed, embed, embed_sz);
+    ggml_backend_tensor_set_async(backend, ie, st_embed, 0, embed_sz);
+    for (int i = 0; i < n_tokens; ++i) st_pos[(size_t)i] = kv_start + i;
+    ggml_backend_tensor_set_async(backend, pp, st_pos, 0, pos_sz);
     if (feat_rows) {
-        std::vector<int32_t> feat_idx((size_t)n_tokens);
         for (int i = 0; i < n_tokens; ++i) {
-            feat_idx[(size_t)i] = (kv_start + i) % cache.target_feat_cap;
+            st_feat[(size_t)i] = (kv_start + i) % cache.target_feat_cap;
         }
-        ggml_backend_tensor_set(feat_rows, feat_idx.data(), 0, ggml_nbytes(feat_rows));
+        ggml_backend_tensor_set_async(backend, feat_rows, st_feat, 0, pos_sz);
     }
 
     if (kvflash) {
@@ -1692,33 +1748,36 @@ bool laguna_verify_batch(
             ggml_free(S.ctx); S.ctx = nullptr;
             return false;
         }
-        ggml_backend_tensor_set(kvi, rows.data(), 0, ggml_nbytes(kvi));
-        ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
-        ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
+        std::memcpy(st_kvi,   rows.data(),  pos_sz);
+        std::memcpy(st_mfull, mfull.data(), mask_sz);
+        std::memcpy(st_mswa,  mswa.data(),  mask_sz);
+        ggml_backend_tensor_set_async(backend, kvi,     st_kvi,   0, pos_sz);
+        ggml_backend_tensor_set_async(backend, mk_full, st_mfull, 0, mask_sz);
+        ggml_backend_tensor_set_async(backend, mk_swa,  st_mswa,  0, mask_sz);
     } else {
         if (kvi) {
-            ggml_backend_tensor_set(kvi, pos.data(), 0, ggml_nbytes(kvi));
+            ggml_backend_tensor_set_async(backend, kvi, st_pos, 0, pos_sz);
         }
 
-        std::vector<float> mfull((size_t)mk_w * n_tokens, -INFINITY);
+        std::fill(st_mfull, st_mfull + (size_t)mk_w * n_tokens, -INFINITY);
         for (int q = 0; q < n_tokens; ++q) {
             const int abs_q = kv_start + q;
             for (int k = 0; k <= abs_q && k < kv_len; ++k) {
-                mfull[(size_t)q * mk_w + k] = 0.0f;
+                st_mfull[(size_t)q * mk_w + k] = 0.0f;
             }
         }
-        ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
+        ggml_backend_tensor_set_async(backend, mk_full, st_mfull, 0, mask_sz);
 
-        std::vector<float> mswa((size_t)mk_w * n_tokens, -INFINITY);
+        std::fill(st_mswa, st_mswa + (size_t)mk_w * n_tokens, -INFINITY);
         const int W = w.sliding_window;
         for (int q = 0; q < n_tokens; ++q) {
             const int abs_q = kv_start + q;
             const int win_lo = std::max(0, abs_q - W + 1);
             for (int k = win_lo; k <= abs_q && k < kv_len; ++k) {
-                mswa[(size_t)q * mk_w + k] = 0.0f;
+                st_mswa[(size_t)q * mk_w + k] = 0.0f;
             }
         }
-        ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
+        ggml_backend_tensor_set_async(backend, mk_swa, st_mswa, 0, mask_sz);
     }
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {

@@ -616,6 +616,15 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     }
 
     auto t_dec0 = std::chrono::steady_clock::now();
+    static const bool step_prof = std::getenv("DFLASH_LAGUNA_STEP_PROF") != nullptr;
+    double prof_draft_ms = 0.0, prof_heads_ms = 0.0, prof_verify_ms = 0.0;
+    auto prof_now = std::chrono::steady_clock::now();
+    auto prof_lap = [&]() {
+        auto t = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t - prof_now).count();
+        prof_now = t;
+        return ms;
+    };
 
     while (n_generated < n_gen) {
         int q_len = base_q_len;
@@ -692,6 +701,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         for (int i = 0; i < block_size; i++) pos_q[(size_t)i] = draft_ctx + i;
         for (int i = 0; i < kctx; i++) pos_k[(size_t)i] = (i < draft_ctx) ? i : 0;
         for (int j = 0; j < block_size; j++) pos_k[(size_t)kctx + j] = draft_ctx + j;
+        if (step_prof) prof_lap();
         ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
                                 sizeof(int32_t) * pos_q.size());
         ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
@@ -706,6 +716,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         local_hidden.resize((size_t)hidden * (size_t)q_len);
         ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
                                 sizeof(float) * local_hidden.size());
+        if (step_prof) prof_draft_ms += prof_lap();
 
         bool used_domino = false;
         if (dw.domino.enabled && q_len > 1 && !sampled_verify && !args_.ddtree_mode) {
@@ -796,6 +807,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             draft_tok[0] = last_tok;
         }
 
+        if (step_prof) prof_heads_ms += prof_lap();
         const bool tree_special_inactive =
             !(budget_hook && !budget_hook->close_token_ids.empty());
         // kvflash: the tree graph is position-indexed, so only take it while
@@ -915,12 +927,14 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         }
 
         int verify_last_tok = -1;
+        if (step_prof) prof_lap();
         if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok)) {
             std::fprintf(stderr, "[laguna-spec] verify failed\n");
             step_graph_destroy(draft_sg);
             return false;
         }
 
+        if (step_prof) prof_verify_ms += prof_lap();
         int accept_n = 1;
         int bonus_tok = -1;
         int verify_vocab = 0;
@@ -1057,6 +1071,15 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
     const int total_draft_pos = std::max(1, n_draft_pos_sum);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
+    if (step_prof && n_draft_steps > 0) {
+        std::fprintf(stderr,
+            "[step-prof] per-step ms: draft=%.2f heads=%.2f verify=%.2f "
+            "other=%.2f total=%.2f (steps=%d)\n",
+            prof_draft_ms / n_draft_steps, prof_heads_ms / n_draft_steps,
+            prof_verify_ms / n_draft_steps,
+            (decode_s * 1000.0 - prof_draft_ms - prof_heads_ms - prof_verify_ms) / n_draft_steps,
+            decode_s * 1000.0 / n_draft_steps, n_draft_steps);
+    }
     std::fprintf(stderr, "[laguna-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
                  n_generated, decode_s,
