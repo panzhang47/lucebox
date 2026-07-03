@@ -48,6 +48,11 @@ struct LagunaBackendArgs {
     ggml_type   kv_type   = GGML_TYPE_Q8_0;
 };
 
+struct LagunaDraftVariant {
+    std::string                name;
+    DraftWeights               weights;
+};
+
 class LagunaBackend : public ModelBackend {
 public:
     explicit LagunaBackend(const LagunaBackendArgs & args);
@@ -100,7 +105,9 @@ private:
 
     // DFlash speculative decode
     ggml_backend_t                              draft_backend_ = nullptr;
-    DraftWeights                                dw_{};
+    std::vector<LagunaDraftVariant>             draft_variants_;
+    DraftWeights *                              active_dw_ = nullptr;
+    std::string                                 default_draft_variant_ = "base";
     DraftFeatureMirror                          feature_mirror_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
     bool                                        draft_parked_ = false;
@@ -180,6 +187,7 @@ private:
     void maybe_post_request_swap();
 
     bool load_decode_draft();
+    bool select_decode_draft(const std::string & name);
     void free_decode_draft();
     bool do_spec_decode(int committed, int n_gen,
                         std::vector<int32_t> & out_tokens,

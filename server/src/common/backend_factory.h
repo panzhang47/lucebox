@@ -11,12 +11,14 @@
 #pragma once
 
 #include "model_backend.h"
+#include "internal.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace dflash::common {
 

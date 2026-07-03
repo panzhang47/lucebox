@@ -33,6 +33,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -195,7 +196,7 @@ static void print_usage(const char * prog) {
         "Usage: %s <model.gguf> [options]\n"
         "\n"
         "Options:\n"
-        "  --draft <path>       Draft model for speculative decode (qwen35 only)\n"
+        "  --draft <path>       Draft model for speculative decode\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"

@@ -12,6 +12,7 @@
 #include "dflash27b.h"
 #include "common/ddtree.h"
 #include "common/domino_head.h"
+#include "common/dspark_head.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
 #include "kv_quant.h"
@@ -46,21 +47,35 @@ namespace dflash::common {
 
 namespace {
 
-static bool laguna_kv_type_env_present() {
-    return std::getenv("DFLASH27B_KV_K") ||
-           std::getenv("DFLASH27B_KV_V") ||
-           std::getenv("DFLASH27B_KV_F16") ||
-           std::getenv("DFLASH27B_KV_Q4") ||
-           std::getenv("DFLASH27B_KV_TQ3");
-}
-
+// Laguna honors only the explicit per-axis --cache-type-k/v overrides.
+// The DFLASH27B_KV_F16/_Q4/_TQ3 shorthands are qwen-family toggles - the
+// server auto-sets _KV_TQ3 for max_ctx > 6144 - and must not displace
+// laguna's Q8_0 default (a TQ3_0/Q4_0 KV cache garbles laguna output).
 static void resolve_laguna_kv_types(const LagunaBackendArgs & args,
                                     ggml_type & k_type,
                                     ggml_type & v_type) {
     k_type = args.kv_type;
     v_type = args.kv_type;
-    if (laguna_kv_type_env_present()) {
-        dflash::resolve_kv_types(k_type, v_type);
+    if (const char * s = std::getenv("DFLASH27B_KV_K")) {
+        const ggml_type parsed = dflash::parse_kv_type(s);
+        if (parsed == GGML_TYPE_COUNT) {
+            std::fprintf(stderr, "[laguna] Unknown KV K type: \"%s\"\n", s);
+            std::abort();
+        }
+        k_type = parsed;
+    }
+    if (const char * s = std::getenv("DFLASH27B_KV_V")) {
+        const ggml_type parsed = dflash::parse_kv_type(s);
+        if (parsed == GGML_TYPE_COUNT) {
+            std::fprintf(stderr, "[laguna] Unknown KV V type: \"%s\"\n", s);
+            std::abort();
+        }
+        v_type = parsed;
+    }
+    if (k_type != args.kv_type || v_type != args.kv_type) {
+        dflash::validate_kv_pair_or_abort(k_type, v_type, "[laguna]");
+        std::fprintf(stderr, "[laguna] KV cache types overridden: K=%s V=%s\n",
+                     dflash::kv_type_name(k_type), dflash::kv_type_name(v_type));
     }
 }
 
@@ -88,6 +103,26 @@ static bool laguna_sampled_verify_enabled(const SamplerCfg & sampler, bool do_sa
         return e != nullptr && std::string(e) == "1";
     }();
     return kSampledVerify && do_sample && sampler.needs_logit_processing();
+}
+
+static bool laguna_dspark_enabled() {
+    static const bool kEnabled = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_DSPARK");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    return kEnabled;
+}
+
+static float laguna_dspark_confidence_threshold() {
+    static const float kThreshold = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_DSPARK_CONFIDENCE_THRESHOLD");
+        if (!e) return 0.0f;
+        float threshold = std::atof(e);
+        if (threshold < 0.0f) threshold = 0.0f;
+        if (threshold > 1.0f) threshold = 1.0f;
+        return threshold;
+    }();
+    return kThreshold;
 }
 
 // ── Construction / initialisation ───────────────────────────────────────
@@ -415,12 +450,15 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                                     bool * forced_close_out,
                                     float * accept_rate_out,
                                     const std::vector<int32_t> * sample_history_prefix) {
+    DraftWeights * active_dw = active_dw_;
+    if (!active_dw) return false;
+    DraftWeights & dw = *active_dw;
     const int hidden = w_.n_embd;
     int32_t last_tok = cache_.last_tok;
     if (last_tok < 0) return false;
 
     DFlashTarget * target = dflash_target_;
-    const int block_size = dw_.block_size;
+    const int block_size = dw.block_size;
     // [TAG_LAGUNA_VERIFY_WIDTH] Speculative verify width (chain). On this MoE
     // target the batched verify forward's cost grows with the verify width: it
     // reads the union of experts the batch routes to (bandwidth-bound), and above
@@ -454,7 +492,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     if (chain_w < 2) chain_w = 2;
     if (chain_w > std::min(block_size, 8)) chain_w = std::min(block_size, 8);
     // DDTree sizes its batch via its budget; chain uses the width chosen above.
-    const int q_len = args_.ddtree_mode ? block_size : chain_w;
+    const int base_q_len = args_.ddtree_mode ? block_size : chain_w;
 
     const bool ignore_eos = (std::getenv("DFLASH_IGNORE_EOS") != nullptr);
     const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, true);
@@ -465,11 +503,11 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     StepGraph draft_sg;
 
     // The draft graph is always block_size-wide (build_draft_step uses
-    // dw_.block_size); chain reads/verifies only its first q_len outputs.
+    // dw.block_size); chain reads/verifies only its first q_len outputs.
     std::vector<float>   noise_embed((size_t)hidden * (size_t)block_size);
     std::vector<int32_t> noise_ids((size_t)block_size);
-    std::vector<int32_t> draft_tok((size_t)q_len);
-    std::vector<int32_t> target_tok((size_t)q_len);
+    std::vector<int32_t> draft_tok((size_t)base_q_len);
+    std::vector<int32_t> target_tok((size_t)base_q_len);
     std::vector<float>   verify_logits;
     std::vector<int32_t> verify_history;
     std::vector<int32_t> pos_q((size_t)block_size);
@@ -481,6 +519,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     int n_generated   = 0;
     int n_draft_steps = 0;
     int n_accept_sum  = 0;
+    int n_draft_pos_sum = 0;
 
     auto argmax_logits = [](const std::vector<float> & ll) {
         int best = 0;
@@ -577,8 +616,20 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     }
 
     auto t_dec0 = std::chrono::steady_clock::now();
+    static const bool step_prof = std::getenv("DFLASH_LAGUNA_STEP_PROF") != nullptr;
+    double prof_draft_ms = 0.0, prof_heads_ms = 0.0, prof_verify_ms = 0.0;
+    auto prof_now = std::chrono::steady_clock::now();
+    auto prof_lap = [&]() {
+        auto t = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t - prof_now).count();
+        prof_now = t;
+        return ms;
+    };
 
     while (n_generated < n_gen) {
+        int q_len = base_q_len;
+        draft_tok.resize((size_t)q_len);
+        target_tok.resize((size_t)q_len);
         const int need_commit_budget = n_gen - n_generated;
 
         if (budget_hook && !budget_hook->close_token_ids.empty()) {
@@ -592,7 +643,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 const bool ok = run_ar_tail(need_commit_budget);
                 auto t_dec1 = std::chrono::steady_clock::now();
                 const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-                const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+                const int total_draft_pos = std::max(1, n_draft_pos_sum);
                 const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
                 std::fprintf(stderr,
                     "[laguna-spec] tail-off-stats tokens=%d time=%.3f s speed=%.2f tok/s "
@@ -626,7 +677,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             const char * e = std::getenv("DFLASH_LAGUNA_DRAFT_PAD");
             return !(e && e[0] == '0' && e[1] == '\0');
         }();
-        if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
+        if (!build_draft_step(draft_sg, dw, /*lm_head=*/nullptr, draft_backend_,
                               draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
                               committed,
                               std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max)),
@@ -650,6 +701,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         for (int i = 0; i < block_size; i++) pos_q[(size_t)i] = draft_ctx + i;
         for (int i = 0; i < kctx; i++) pos_k[(size_t)i] = (i < draft_ctx) ? i : 0;
         for (int j = 0; j < block_size; j++) pos_k[(size_t)kctx + j] = draft_ctx + j;
+        if (step_prof) prof_lap();
         ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
                                 sizeof(int32_t) * pos_q.size());
         ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
@@ -664,15 +716,16 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         local_hidden.resize((size_t)hidden * (size_t)q_len);
         ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
                                 sizeof(float) * local_hidden.size());
+        if (step_prof) prof_draft_ms += prof_lap();
 
         bool used_domino = false;
-        if (dw_.domino.enabled && q_len > 1 && !sampled_verify && !args_.ddtree_mode) {
+        if (dw.domino.enabled && q_len > 1 && !sampled_verify && !args_.ddtree_mode) {
             static std::atomic<bool> s_domino_logged{false};
             if (!s_domino_logged.exchange(true)) {
                 std::fprintf(stderr,
                     "[laguna-spec] Domino GRU head active for greedy chain decode "
                     "(H=%d E=%d)\n",
-                    dw_.domino.gru_hidden_dim, dw_.domino.emb_dim);
+                    dw.domino.gru_hidden_dim, dw.domino.emb_dim);
             }
             static const bool fused_domino = []() {
                 const char * e = std::getenv("DFLASH_LAGUNA_FUSED_DOMINO");
@@ -682,7 +735,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 // Run on the draft backend: same stream as the draft forward,
                 // second graph key in the multi-key CUDA-graph cache.
                 if (domino_correct_greedy_chain_fused(
-                        dw_, draft_backend_, target->lm_head_tensor(),
+                        dw, draft_backend_, target->lm_head_tensor(),
                         target->gpu_embd_table(), local_hidden.data(), q_len,
                         last_tok, draft_tok)) {
                     used_domino = true;
@@ -690,7 +743,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             }
             if (used_domino) {
                 // fused path done
-            } else if (domino_correct_greedy_chain(dw_, draft_backend_, *target,
+            } else if (domino_correct_greedy_chain(dw, draft_backend_, *target,
                                             local_hidden.data(), q_len,
                                             last_tok, draft_tok)) {
                 used_domino = true;
@@ -703,7 +756,49 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 }
             }
         }
-        if (!used_domino) {
+        bool used_dspark = false;
+        if (!used_domino && laguna_dspark_enabled() && dw.dspark.enabled &&
+            q_len > 1 && !sampled_verify && !args_.ddtree_mode) {
+            static std::atomic<bool> s_dspark_logged{false};
+            if (!s_dspark_logged.exchange(true)) {
+                std::fprintf(stderr,
+                    "[laguna-spec] DSpark Markov head active for greedy chain decode "
+                    "(rank=%d vocab=%d confidence_dim=%d)\n",
+                    dw.dspark.markov_rank, dw.dspark.vocab_size, dw.dspark.confidence_dim);
+            }
+            static const bool fused_dspark = []() {
+                const char * e = std::getenv("DFLASH_LAGUNA_FUSED_DSPARK");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            bool ds_ok = false;
+            if (fused_dspark && laguna_dspark_confidence_threshold() <= 0.0f) {
+                // One graph on the draft stream: lm_head + markov chain +
+                // in-graph argmax; no host logits round-trip.
+                ds_ok = dspark_markov_correct_greedy_chain_fused(
+                    dw, draft_backend_, target->lm_head_tensor(),
+                    local_hidden.data(), q_len, last_tok, draft_tok);
+            }
+            if (!ds_ok) {
+                ds_ok = dspark_markov_correct_greedy_chain(dw, draft_backend_, *target,
+                                                   local_hidden.data(), q_len,
+                                                   last_tok,
+                                                   laguna_dspark_confidence_threshold(),
+                                                   draft_tok);
+            }
+            if (ds_ok) {
+                used_dspark = true;
+                q_len = (int)draft_tok.size();
+                target_tok.resize((size_t)q_len);
+            } else {
+                static std::atomic<bool> s_dspark_warned{false};
+                if (!s_dspark_warned.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[laguna-spec] DSpark Markov head failed; falling back to base "
+                        "DFlash projection\n");
+                }
+            }
+        }
+        if (!used_domino && !used_dspark) {
             if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
                 std::fprintf(stderr, "[laguna-spec] projection failed\n");
                 step_graph_destroy(draft_sg);
@@ -712,6 +807,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             draft_tok[0] = last_tok;
         }
 
+        if (step_prof) prof_heads_ms += prof_lap();
         const bool tree_special_inactive =
             !(budget_hook && !budget_hook->close_token_ids.empty());
         // kvflash: the tree graph is position-indexed, so only take it while
@@ -727,7 +823,25 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             const int K = (args_.ddtree_budget > L) ? 8 : 1;
             std::vector<float> top_lp;
             std::vector<int32_t> top_ids;
-            if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+            static const bool dspark_tree = []() {
+                const char * e = std::getenv("DFLASH_LAGUNA_DSPARK_TREE");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            bool topk_ok = false;
+            if (dspark_tree && laguna_dspark_enabled() && dw.dspark.enabled) {
+                static std::atomic<bool> s_dstree_logged{false};
+                if (!s_dstree_logged.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[laguna-spec] DSpark Markov head active for DDTree candidates\n");
+                }
+                topk_ok = dspark_markov_project_topk(dw, draft_backend_,
+                                                     target->lm_head_tensor(),
+                                                     local_hidden.data(), q_len, K,
+                                                     args_.ddtree_temp, last_tok,
+                                                     top_lp, top_ids);
+            }
+            if (!topk_ok &&
+                !target->project_hidden_to_topk(local_hidden.data(), q_len, K,
                                                 args_.ddtree_temp, top_lp, top_ids)) {
                 std::fprintf(stderr, "[laguna-spec] ddtree topk projection failed\n");
                 step_graph_destroy(draft_sg);
@@ -780,6 +894,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
             n_accept_sum += std::max(0, emitted - 1);
             n_draft_steps++;
+            n_draft_pos_sum += q_len;
             if (io.cancelled || hit_eos || emitted <= 0 || next_token < 0 ||
                 (!ignore_eos && target->is_eos(next_token))) {
                 committed += emitted;
@@ -812,12 +927,14 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         }
 
         int verify_last_tok = -1;
+        if (step_prof) prof_lap();
         if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok)) {
             std::fprintf(stderr, "[laguna-spec] verify failed\n");
             step_graph_destroy(draft_sg);
             return false;
         }
 
+        if (step_prof) prof_verify_ms += prof_lap();
         int accept_n = 1;
         int bonus_tok = -1;
         int verify_vocab = 0;
@@ -943,6 +1060,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
+        n_draft_pos_sum += q_len;
         if (io.cancelled) break;
         if (hit_eos) break;
     }
@@ -951,8 +1069,17 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = std::max(1, n_draft_pos_sum);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
+    if (step_prof && n_draft_steps > 0) {
+        std::fprintf(stderr,
+            "[step-prof] per-step ms: draft=%.2f heads=%.2f verify=%.2f "
+            "other=%.2f total=%.2f (steps=%d)\n",
+            prof_draft_ms / n_draft_steps, prof_heads_ms / n_draft_steps,
+            prof_verify_ms / n_draft_steps,
+            (decode_s * 1000.0 - prof_draft_ms - prof_heads_ms - prof_verify_ms) / n_draft_steps,
+            decode_s * 1000.0 / n_draft_steps, n_draft_steps);
+    }
     std::fprintf(stderr, "[laguna-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
                  n_generated, decode_s,
@@ -1095,11 +1222,11 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     cache_.last_tok = argmax(last_logits);
     result.tokens.reserve(req.n_gen);
     const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, req.do_sample);
-
     const bool can_spec = req.n_gen > 0
         && !req.force_ar_decode
         && !args_.draft_path.empty()
         && dflash_target_
+        && select_decode_draft(std::string())
         && !draft_parked_
         && feature_mirror_.target_feat
         && cache_.target_feat
@@ -1319,11 +1446,11 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     cache_.last_tok = argmax(last_logits);
     result.tokens.reserve(req.n_gen);
     const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, req.do_sample);
-
     const bool can_spec = req.n_gen > 0
         && !req.force_ar_decode
         && !args_.draft_path.empty()
         && dflash_target_
+        && select_decode_draft(std::string())
         && !draft_parked_
         && feature_mirror_.target_feat
         && cache_.target_feat
@@ -2885,7 +3012,7 @@ void LagunaBackend::maybe_post_request_swap() {
 
 bool LagunaBackend::load_decode_draft() {
     if (args_.draft_path.empty()) return false;
-    if (draft_backend_ && feature_mirror_.target_feat) {
+    if (draft_backend_ && feature_mirror_.target_feat && !draft_variants_.empty()) {
         draft_parked_ = false;
         return true;
     }
@@ -2901,57 +3028,85 @@ bool LagunaBackend::load_decode_draft() {
         draft_backend_ = backend_;
     }
 
-    if (!load_draft_gguf(args_.draft_path, draft_backend_, dw_, nullptr)) {
-        std::fprintf(stderr, "[laguna] draft load failed: %s\n", dflash27b_last_error());
-        if (draft_backend_ && draft_backend_ != backend_) {
-            ggml_backend_free(draft_backend_);
+    draft_variants_.clear();
+    draft_variants_.push_back(LagunaDraftVariant{});
+    draft_variants_.back().name = "base";
+
+    int base_fc_in = 0;
+    int base_draft_hidden = 0;
+    int base_n_capture = 0;
+
+    for (LagunaDraftVariant & variant : draft_variants_) {
+        if (!load_draft_gguf(args_.draft_path, draft_backend_, variant.weights,
+                             nullptr)) {
+            std::fprintf(stderr, "[laguna] draft load failed for variant '%s': %s\n",
+                         variant.name.c_str(), dflash27b_last_error());
+            free_decode_draft();
+            return false;
         }
-        draft_backend_ = nullptr;
-        return false;
+
+        DraftWeights & dw = variant.weights;
+        dw.mask_token_id = 12;
+        const int draft_hidden = (int)dw.fc->ne[1];
+        const int fc_in = (int)dw.fc->ne[0];
+        const int n_capture = fc_in / w_.n_embd;
+
+        if (draft_hidden != dw.n_embd) {
+            std::printf("[laguna] draft[%s]: overriding n_embd %d -> %d (from fc weight)\n",
+                        variant.name.c_str(), dw.n_embd, draft_hidden);
+            dw.n_embd = draft_hidden;
+        }
+        if (dw.n_layer > 0 && dw.layers[0].wq) {
+            const int q_dim = (int)dw.layers[0].wq->ne[1];
+            const int inferred_n_head = q_dim / dw.head_dim;
+            if (inferred_n_head != dw.n_head) {
+                std::printf("[laguna] draft[%s]: overriding n_head %d -> %d\n",
+                            variant.name.c_str(), dw.n_head, inferred_n_head);
+                dw.n_head = inferred_n_head;
+            }
+        }
+        if (dw.n_layer > 0 && dw.layers[0].w_gate) {
+            const int inferred_ff = (int)dw.layers[0].w_gate->ne[1];
+            if (inferred_ff != dw.n_ff) {
+                std::printf("[laguna] draft[%s]: overriding n_ff %d -> %d\n",
+                            variant.name.c_str(), dw.n_ff, inferred_ff);
+                dw.n_ff = inferred_ff;
+            }
+        }
+        dw.n_target_layers = n_capture;
+        dw.swa_window = 2048;
+        for (int i = 0; i < dw.n_layer - 1 && i < (int)dw.layers.size(); i++) {
+            dw.layers[(size_t)i].is_swa = true;
+        }
+
+        if (base_fc_in == 0) {
+            base_fc_in = fc_in;
+            base_draft_hidden = draft_hidden;
+            base_n_capture = n_capture;
+        } else if (fc_in != base_fc_in || draft_hidden != base_draft_hidden ||
+                   n_capture != base_n_capture) {
+            std::fprintf(stderr,
+                "[laguna] draft variant '%s' changed draft dimensions "
+                "(fc_in=%d hidden=%d capture=%d, base fc_in=%d hidden=%d capture=%d)\n",
+                variant.name.c_str(), fc_in, draft_hidden, n_capture,
+                base_fc_in, base_draft_hidden, base_n_capture);
+            free_decode_draft();
+            return false;
+        }
+
+        std::printf("[laguna] draft variant loaded: name=%s fc_in=%d "
+                    "target_hidden=%d draft_hidden=%d n_capture_layers=%d swa=%d\n",
+                    variant.name.c_str(), fc_in, w_.n_embd,
+                    draft_hidden, n_capture, dw.swa_window);
     }
 
-    dw_.mask_token_id = 12;
-    const int draft_hidden = (int)dw_.fc->ne[1];
-    const int fc_in = (int)dw_.fc->ne[0];
-    const int n_capture = fc_in / w_.n_embd;
-
-    if (draft_hidden != dw_.n_embd) {
-        std::printf("[laguna] draft: overriding n_embd %d -> %d (from fc weight)\n",
-                    dw_.n_embd, draft_hidden);
-        dw_.n_embd = draft_hidden;
-    }
-    if (dw_.n_layer > 0 && dw_.layers[0].wq) {
-        const int q_dim = (int)dw_.layers[0].wq->ne[1];
-        const int inferred_n_head = q_dim / dw_.head_dim;
-        if (inferred_n_head != dw_.n_head) {
-            std::printf("[laguna] draft: overriding n_head %d -> %d\n",
-                        dw_.n_head, inferred_n_head);
-            dw_.n_head = inferred_n_head;
-        }
-    }
-    if (dw_.n_layer > 0 && dw_.layers[0].w_gate) {
-        const int inferred_ff = (int)dw_.layers[0].w_gate->ne[1];
-        if (inferred_ff != dw_.n_ff) {
-            std::printf("[laguna] draft: overriding n_ff %d -> %d\n",
-                        dw_.n_ff, inferred_ff);
-            dw_.n_ff = inferred_ff;
-        }
-    }
-    dw_.n_target_layers = n_capture;
-    dw_.swa_window = 2048;
-    for (int i = 0; i < dw_.n_layer - 1 && i < (int)dw_.layers.size(); i++) {
-        dw_.layers[(size_t)i].is_swa = true;
-    }
-
-    std::printf("[laguna] draft loaded: fc_in=%d target_hidden=%d "
-                "draft_hidden=%d n_capture_layers=%d swa=%d\n",
-                fc_in, w_.n_embd, draft_hidden, n_capture, dw_.swa_window);
+    const int n_capture = base_n_capture;
 
     constexpr int TARGET_FEAT_CAP = 4096;
     const int feat_cap = std::min(args_.max_ctx, TARGET_FEAT_CAP);
     if (!cache_.target_feat &&
         !create_laguna_target_feat(backend_, cache_, n_capture, w_.n_embd, feat_cap,
-                                   dw_.capture_layer_ids)) {
+                                   draft_variants_[0].weights.capture_layer_ids)) {
         std::fprintf(stderr, "[laguna] target_feat alloc failed\n");
         free_decode_draft();
         return false;
@@ -2962,6 +3117,12 @@ bool LagunaBackend::load_decode_draft() {
                                    draft_gpu, args_.device.gpu, mirror_cap,
                                    n_capture, w_.n_embd)) {
         std::fprintf(stderr, "[laguna] feature mirror init failed\n");
+        free_decode_draft();
+        return false;
+    }
+
+    default_draft_variant_ = "base";
+    if (!select_decode_draft(default_draft_variant_)) {
         free_decode_draft();
         return false;
     }
@@ -2982,14 +3143,39 @@ bool LagunaBackend::load_decode_draft() {
     return true;
 }
 
+bool LagunaBackend::select_decode_draft(const std::string & name) {
+    std::string wanted = name;
+    if (wanted.empty()) {
+        wanted = default_draft_variant_;
+    }
+    for (LagunaDraftVariant & variant : draft_variants_) {
+        if (variant.name == wanted) {
+            if (active_dw_ != &variant.weights) {
+                std::fprintf(stderr, "[laguna] selected draft variant: %s\n",
+                             variant.name.c_str());
+            }
+            active_dw_ = &variant.weights;
+            return true;
+        }
+    }
+    std::fprintf(stderr, "[laguna] unknown draft variant '%s'\n",
+                 wanted.c_str());
+    return false;
+}
+
 void LagunaBackend::free_decode_draft() {
     delete dflash_target_;
     dflash_target_ = nullptr;
     draft_feature_mirror_free(feature_mirror_);
     free_laguna_target_feat(cache_);
-    if (dw_.ctx) {
-        free_draft_weights(dw_);
+    for (LagunaDraftVariant & variant : draft_variants_) {
+        if (variant.weights.ctx) {
+            free_draft_weights(variant.weights);
+        }
     }
+    draft_variants_.clear();
+    active_dw_ = nullptr;
+    default_draft_variant_ = "base";
     if (draft_backend_ && draft_backend_ != backend_) {
         ggml_backend_free(draft_backend_);
     }
