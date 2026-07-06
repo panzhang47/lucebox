@@ -133,6 +133,11 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _dflash_archs "121")
         endif()
     endif()
+    # Keep the vendored ggml-cuda build aligned with the resolved dflash arch list.
+    # Otherwise ggml may inherit CMake's compiler-default arch (for example sm_52),
+    # which triggers massive first-request PTX JIT on newer GPUs even though
+    # dflash_common itself is compiled for the intended arch set.
+    set(CMAKE_CUDA_ARCHITECTURES "${_dflash_archs}" CACHE STRING "" FORCE)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # User override precedence: -DDFLASH27B_HIP_ARCHITECTURES → -DAMDGPU_TARGETS
     # → gfx1151 default (Strix Halo).
@@ -222,6 +227,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
 
@@ -245,6 +251,13 @@ add_library(dflash_common STATIC
     src/gemma4/gemma4_daemon.cpp
     src/gemma4/gemma4_dflash_target.cpp
     src/gemma4/gemma4_layer_split_adapter.cpp
+    # DeepSeek V4 Flash target arch
+    src/deepseek4/deepseek4_loader.cpp
+    src/deepseek4/deepseek4_graph.cpp
+    src/deepseek4/deepseek4_backend.cpp
+    src/deepseek4/deepseek4_daemon.cpp
+    src/deepseek4/deepseek4_layer_split_adapter.cpp
+    src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -348,7 +361,9 @@ endif()
 # Apply the arch list to local sources. HIP builds pass CMAKE_HIP_ARCHITECTURES
 # through to the HIP toolchain/ggml backend and optionally build rocWMMA kernels.
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-    target_sources(dflash_common PRIVATE src/cuda_cross_device_copy.cpp)
+    target_sources(dflash_common PRIVATE
+        src/cuda_cross_device_copy.cpp
+        src/deepseek4/deepseek4_hc_cuda.cu)
     set_target_properties(dflash_common PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
     list(GET _dflash_archs 0 _dflash_cuda_min_sm)
     # Strip any trailing 'a' suffix (e.g. "121a" -> "121")
@@ -358,6 +373,8 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
         DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm}
         DFLASH27B_MIN_SM=${_dflash_cuda_min_sm})
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    target_sources(dflash_common PRIVATE src/deepseek4/deepseek4_hc_cuda.cu)
+    set_source_files_properties(src/deepseek4/deepseek4_hc_cuda.cu PROPERTIES LANGUAGE HIP)
     set_target_properties(dflash_common PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
     target_compile_definitions(dflash_common PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
     # hip_compat shim is needed by ALL dflash_common sources (peer_access.cpp,
@@ -581,9 +598,6 @@ find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dflash_common PRIVATE OpenMP::OpenMP_CXX)
 endif()
-if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-    target_link_libraries(dflash_common PRIVATE hip::host)
-endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
      target_compile_options(dflash_common PRIVATE
@@ -601,6 +615,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
     add_executable(pflash_daemon test/pflash_daemon.cpp)
     target_include_directories(pflash_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     target_link_libraries(pflash_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        target_link_libraries(pflash_daemon PRIVATE CUDA::cudart)
+    else()
+        target_link_libraries(pflash_daemon PRIVATE hip::host)
+    endif()
 endif()
 
 # ─── Tests (numerics vs oracle) ────────────────────────────────────
@@ -748,6 +767,25 @@ if(DFLASH27B_TESTS)
             target_include_directories(test_qwen35moe_swap_manager PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
         endif()
         target_link_libraries(test_qwen35moe_swap_manager PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_unit.cpp")
+        add_executable(test_deepseek4_unit test/test_deepseek4_unit.cpp)
+        target_include_directories(test_deepseek4_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_deepseek4_unit PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_deepseek4_unit PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+        endif()
+        target_link_libraries(test_deepseek4_unit PRIVATE dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_deepseek4_unit PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_deepseek4_unit PRIVATE hip::host)
+        endif()
+        add_test(NAME deepseek4_unit COMMAND test_deepseek4_unit)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)
@@ -941,9 +979,13 @@ if(DFLASH27B_TESTS)
 
     # 'make check' — builds test targets then runs ctest
     if(TARGET test_server_unit)
+        set(_check_deps test_server_unit)
+        if(TARGET test_deepseek4_unit)
+            list(APPEND _check_deps test_deepseek4_unit)
+        endif()
         add_custom_target(check
             COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-            DEPENDS test_server_unit
+            DEPENDS ${_check_deps}
             COMMENT "Building and running unit tests"
         )
     else()

@@ -189,7 +189,11 @@ MoeHybridStorage::~MoeHybridStorage() {
 }
 
 bool MoeHybridStorage::matches(const MoeHybridConfig & cfg) const {
-    return placement.matches(cfg) && (int)layers.size() == cfg.n_layer;
+    return placement.matches(cfg) &&
+           (int)layers.size() == cfg.n_layer &&
+           cold_backend_kind == cfg.cold_expert_backend &&
+           materialized_hot_experts == cfg.materialize_hot_experts &&
+           materialized_cold_experts == cfg.materialize_cold_experts;
 }
 
 bool MoeHybridStorage::empty() const {
@@ -219,10 +223,20 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         return false;
     }
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
+    out.cold_backend_kind = cfg.cold_expert_backend;
+    out.materialized_hot_experts = cfg.materialize_hot_experts;
+    out.materialized_cold_experts = cfg.materialize_cold_experts;
+    out.cold_backend = (cfg.cold_expert_backend == MoeHybridColdBackend::Gpu) ? gpu_backend : out.cpu_backend;
+    if (!out.cold_backend) {
+        if (err) *err = "failed to select cold expert backend";
+        return false;
+    }
 
     for (int il = 0; il < cfg.n_layer; ++il) {
         const MoeLayerDesc & desc = layer_descs[(size_t)il];
         MoeHybridLayerStorage & dst = out.layers[(size_t)il];
+        dst.cold_backend = out.cold_backend;
+        dst.cold_backend_kind = out.cold_backend_kind;
 
         // Skip dense layers (no experts)
         if (!desc.ffn_gate_exps && !desc.ffn_up_exps && !desc.ffn_down_exps && !desc.ffn_gate_up_exps) {
@@ -269,7 +283,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         const int hot_count = (int)dst.hot_expert_ids.size();
 
         // Allocate hot expert tensors on GPU
-        if (hot_count > 0) {
+        if (hot_count > 0 && cfg.materialize_hot_experts) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -319,8 +333,8 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
             }
         }
 
-        // Allocate cold expert tensors on CPU
-        if (cold_count > 0) {
+        // Allocate cold expert tensors on the selected cold backend.
+        if (cold_count > 0 && cfg.materialize_cold_experts) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -338,9 +352,18 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                 dst.up_cold   = new_like_with_expert_count(dst.cold_ctx, desc.ffn_up_exps, cold_count);
                 dst.down_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_down_exps, cold_count);
             }
-            dst.cold_buf = ggml_backend_alloc_ctx_tensors_from_buft(dst.cold_ctx, ggml_backend_cuda_host_buffer_type());
+            dst.cold_buf = ggml_backend_alloc_ctx_tensors(dst.cold_ctx, out.cold_backend);
+
+
+
+
+
             if (!dst.cold_buf) {
-                if (err) *err = "failed to allocate cold expert buffer";
+                if (err) {
+                    *err = (out.cold_backend_kind == MoeHybridColdBackend::Gpu)
+                        ? "failed to allocate cold expert GPU buffer"
+                        : "failed to allocate cold expert CPU buffer";
+                }
                 return false;
             }
 
@@ -402,11 +425,21 @@ bool build_moe_hybrid_storage_from_file(
         return false;
     }
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
+    out.cold_backend_kind = cfg.cold_expert_backend;
+    out.materialized_hot_experts = cfg.materialize_hot_experts;
+    out.materialized_cold_experts = cfg.materialize_cold_experts;
+    out.cold_backend = (cfg.cold_expert_backend == MoeHybridColdBackend::Gpu) ? gpu_backend : out.cpu_backend;
+    if (!out.cold_backend) {
+        if (err) *err = "failed to select cold expert backend";
+        return false;
+    }
 
     for (int il = 0; il < cfg.n_layer; ++il) {
         const MoeLayerDesc & desc = layer_descs[(size_t)il];
         const LayerExpertFileData & fd = file_data[(size_t)il];
         MoeHybridLayerStorage & dst = out.layers[(size_t)il];
+        dst.cold_backend = out.cold_backend;
+        dst.cold_backend_kind = out.cold_backend_kind;
 
         // Skip dense layers (no experts)
         if (!desc.ffn_gate_exps && !desc.ffn_up_exps && !desc.ffn_down_exps && !desc.ffn_gate_up_exps) {
@@ -462,7 +495,7 @@ bool build_moe_hybrid_storage_from_file(
         dst.spare_lru.assign((size_t)spare, 0);
 
         // Allocate hot expert tensors on GPU
-        if (hot_count > 0) {
+        if (hot_count > 0 && cfg.materialize_hot_experts) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -515,8 +548,8 @@ bool build_moe_hybrid_storage_from_file(
             }
         }
 
-        // Allocate cold expert tensors on CPU
-        if (allocate_cold && cold_count > 0) {
+        // Allocate cold expert tensors on the selected cold backend.
+        if (allocate_cold && cold_count > 0 && cfg.materialize_cold_experts) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -534,9 +567,13 @@ bool build_moe_hybrid_storage_from_file(
                 dst.up_cold   = new_like_with_expert_count(dst.cold_ctx, desc.ffn_up_exps, cold_count);
                 dst.down_cold = new_like_with_expert_count(dst.cold_ctx, desc.ffn_down_exps, cold_count);
             }
-            dst.cold_buf = ggml_backend_alloc_ctx_tensors_from_buft(dst.cold_ctx, ggml_backend_cuda_host_buffer_type());
+            dst.cold_buf = ggml_backend_alloc_ctx_tensors(dst.cold_ctx, out.cold_backend);
             if (!dst.cold_buf) {
-                if (err) *err = "failed to allocate cold expert CPU buffer";
+                if (err) {
+                    *err = (out.cold_backend_kind == MoeHybridColdBackend::Gpu)
+                        ? "failed to allocate cold expert GPU buffer"
+                        : "failed to allocate cold expert CPU buffer";
+                }
                 return false;
             }
 

@@ -33,6 +33,7 @@ const char * backend_ipc_mode_name(BackendIpcMode mode) {
         case BackendIpcMode::Gemma4TargetShard: return "gemma4-target-shard";
         case BackendIpcMode::LagunaTargetShard: return "laguna-target-shard";
         case BackendIpcMode::MoeExpertCompute: return "moe-expert-compute";
+        case BackendIpcMode::DeepSeek4TargetShard: return "deepseek4-target-shard";
     }
     return "unknown";
 }
@@ -60,6 +61,10 @@ bool parse_backend_ipc_mode(const std::string & value, BackendIpcMode & out) {
     }
     if (value == "moe-expert-compute") {
         out = BackendIpcMode::MoeExpertCompute;
+        return true;
+    }
+    if (value == "deepseek4-target-shard") {
+        out = BackendIpcMode::DeepSeek4TargetShard;
         return true;
     }
     return false;
@@ -164,7 +169,8 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         ::close(stream_pipe[0]);
 
         std::vector<std::string> argv_storage;
-        argv_storage.reserve(cfg.args.size() + 6);
+        argv_storage.reserve(cfg.args.size() + 7);
+        const std::string & exec_bin = cfg.bin;
         argv_storage.emplace_back(cfg.bin);
         argv_storage.emplace_back(
             std::string("--backend-ipc-mode=") + backend_ipc_mode_name(cfg.mode));
@@ -177,15 +183,16 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
             argv_storage.emplace_back("--shared-payload-bytes=" +
                                       std::to_string(shared_payload_capacity_));
         }
-        argv_storage.emplace_back("--stream-fd=" + std::to_string(stream_pipe[1]));
+        argv_storage.emplace_back("--stream-fd=" +
+                                  std::to_string(stream_pipe[1]));
 
         std::vector<char *> argv;
         argv.reserve(argv_storage.size() + 1);
         for (std::string & arg : argv_storage) argv.push_back(arg.data());
         argv.push_back(nullptr);
-        ::execv(cfg.bin.c_str(), argv.data());
+        ::execv(exec_bin.c_str(), argv.data());
         std::fprintf(stderr, "backend-ipc exec failed: %s: %s\n",
-                     cfg.bin.c_str(), std::strerror(errno));
+                     exec_bin.c_str(), std::strerror(errno));
         _exit(127);
     }
 

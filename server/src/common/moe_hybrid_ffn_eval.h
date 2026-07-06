@@ -94,6 +94,18 @@ struct MoeHybridFfnTelemetry {
     uint64_t cold_us = 0;
     uint64_t shared_us = 0;
     uint64_t combine_us = 0;
+    uint64_t hot_graph_build_us = 0;
+    uint64_t hot_input_us = 0;
+    uint64_t hot_compute_us = 0;
+    uint64_t hot_read_us = 0;
+    uint64_t cold_graph_build_us = 0;
+    uint64_t cold_input_us = 0;
+    uint64_t cold_compute_us = 0;
+    uint64_t cold_read_us = 0;
+    uint64_t hot_graph_builds = 0;
+    uint64_t hot_graph_hits = 0;
+    uint64_t cold_graph_builds = 0;
+    uint64_t cold_graph_hits = 0;
     int hot_selected = 0;
     int cold_selected = 0;
 };
@@ -180,6 +192,12 @@ bool eval_moe_hybrid_ffn_gpu_resident(
     MoeExpertCompute *                expert_compute = nullptr,
     const MoeExpertLayer *            expert_layer = nullptr);
 
+struct CachedHotGraphOptions {
+    float swiglu_clamp = 0.0f;
+    bool gpu_remap = false;
+    int n_expert = 0;
+};
+
 // Build/rebuild cached hot FFN graph.
 bool build_cached_hot_graph(
     CachedFfnGraph & out,
@@ -196,8 +214,7 @@ bool build_cached_hot_graph(
     int n_embd,
     int n_ff_exp,
     int n_hot,
-    bool gpu_remap = false,
-    int n_expert = 0);
+    CachedHotGraphOptions options = {});
 
 // Build/rebuild cached MoE expert compute graph.
 bool build_cached_cold_graph(
@@ -213,7 +230,8 @@ bool build_cached_cold_graph(
     float gate_up_scale,
     int n_embd,
     int n_ff_exp,
-    int n_cold);
+    int n_cold,
+    float swiglu_clamp = 0.0f);
 
 // Build cached hot-only batched graph for prefill (n_tokens=MMQ_SAFE_SUB_BATCH).
 bool build_cached_hot_batched_graph(
