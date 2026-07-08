@@ -17,6 +17,7 @@
 //   blk.<i>.attn_k.weight                   [kv_dim, hidden]    Q8_0 / F16
 //   blk.<i>.attn_v.weight                   [kv_dim, hidden]    Q8_0 / F16
 //   blk.<i>.attn_output.weight              [hidden, q_dim]     Q8_0 / F16
+//   blk.<i>.attn_gate.weight                [n_head, hidden]    optional Laguna XS 2.1 gate
 //   blk.<i>.attn_q_norm.weight              [head_dim]          F32
 //   blk.<i>.attn_k_norm.weight              [head_dim]          F32
 //   blk.<i>.ffn_gate.weight                 [intermediate, hidden]  Q8_0 / F16
@@ -62,6 +63,14 @@ int count_swa_layers(const DraftWeights & w) {
         if (layer.is_swa) n_swa++;
     }
     return n_swa;
+}
+
+int count_attn_gate_layers(const DraftWeights & w) {
+    int n_gate = 0;
+    for (const DraftLayer & layer : w.layers) {
+        if (layer.attn_gate) n_gate++;
+    }
+    return n_gate;
 }
 
 bool check_shape_1d(const ggml_tensor * t, int64_t ne0, const char * name, char * buf, size_t buf_sz) {
@@ -256,6 +265,20 @@ bool load_draft_gguf(const std::string & path,
         return false;
     }
 
+    out.aux_hidden_norms.clear();
+    {
+        int aux_count = 0;
+        for (;;) {
+            char aux_name[128];
+            std::snprintf(aux_name, sizeof(aux_name),
+                          "dflash.aux_hidden_norm.%d.weight", aux_count);
+            ggml_tensor * t = g(aux_name);
+            if (!t) break;
+            out.aux_hidden_norms.push_back(t);
+            aux_count++;
+        }
+    }
+
     for (int il = 0; il < out.n_layer; il++) {
         char name[128];
         auto fnd = [&](const char * suffix) -> ggml_tensor * {
@@ -270,6 +293,7 @@ bool load_draft_gguf(const std::string & path,
         L.wk        = fnd("attn_k.weight");
         L.wv        = fnd("attn_v.weight");
         L.wo        = fnd("attn_output.weight");
+        L.attn_gate = fnd("attn_gate.weight");
         L.q_norm    = fnd("attn_q_norm.weight");
         L.k_norm    = fnd("attn_k_norm.weight");
         L.w_gate    = fnd("ffn_gate.weight");
@@ -283,6 +307,17 @@ bool load_draft_gguf(const std::string & path,
             gguf_free(gctx);
             return false;
         }
+    }
+
+    const int n_gate_layers = count_attn_gate_layers(out);
+    if (n_gate_layers != 0 && n_gate_layers != out.n_layer) {
+        char b[160];
+        std::snprintf(b, sizeof(b),
+                      "draft GGUF: incomplete attention gate tensors: %d/%d layers",
+                      n_gate_layers, out.n_layer);
+        set_last_error(b);
+        gguf_free(gctx);
+        return false;
     }
 
     out.domino = DraftDominoWeights{};
@@ -417,6 +452,8 @@ bool load_draft_gguf(const std::string & path,
         std::fprintf(stderr, "[draft GGUF] SWA layers: %d/%d (window=%d)\n",
                      n_swa, out.n_layer, out.swa_window);
     }
+    const bool meta_context_kv_layer_norm =
+        read_u32("dflash.context_kv_layer_norm", 0) != 0;
 
     // ── 3. Allocate CUDA buffer for all tensors ──────────────────────────
     out.buf = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
@@ -503,6 +540,65 @@ bool load_draft_gguf(const std::string & path,
                     return false;
                 }
             }
+        }
+        if (!out.aux_hidden_norms.empty()) {
+            const int64_t derived_fc_in = out.fc->ne[0];
+            const int derived_layers =
+                (out.n_embd > 0 && derived_fc_in % out.n_embd == 0)
+                    ? (int)(derived_fc_in / out.n_embd)
+                    : -1;
+            if ((int)out.aux_hidden_norms.size() != derived_layers) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "draft GGUF: aux hidden norms count %zu != fc-derived capture count %d",
+                    out.aux_hidden_norms.size(), derived_layers);
+                set_last_error(buf);
+                return false;
+            }
+            for (size_t i = 0; i < out.aux_hidden_norms.size(); i++) {
+                const ggml_tensor * t = out.aux_hidden_norms[i];
+                if (!t || t->ne[0] != exp_n_embd) {
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf),
+                        "draft GGUF: aux hidden norm %zu shape mismatch: got [%lld], expected [%lld]",
+                        i, t ? (long long)t->ne[0] : -1LL, (long long)exp_n_embd);
+                    set_last_error(buf);
+                    return false;
+                }
+            }
+            std::fprintf(stderr, "[draft GGUF] aux hidden norms enabled: %zu capture layers\n",
+                         out.aux_hidden_norms.size());
+        }
+        if (n_gate_layers > 0) {
+            const int64_t exp_q_dim = (int64_t)out.n_head * out.head_dim;
+            for (int il = 0; il < out.n_layer; il++) {
+                DraftLayer & L = out.layers[il];
+                const int64_t gate_in  = L.attn_gate->ne[0];
+                const int64_t gate_out = L.attn_gate->ne[1];
+                if (gate_in != exp_n_embd ||
+                    (gate_out != out.n_head && gate_out != exp_q_dim)) {
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf),
+                        "draft GGUF: blk.%d attn_gate.weight shape mismatch: got [%lld,%lld], expected [%lld,%d] or [%lld,%lld]",
+                        il, (long long)gate_in, (long long)gate_out,
+                        (long long)exp_n_embd, out.n_head,
+                        (long long)exp_n_embd, (long long)exp_q_dim);
+                    set_last_error(buf);
+                    return false;
+                }
+                L.attn_gate_per_head = gate_out == out.n_head;
+            }
+            std::fprintf(stderr, "[draft GGUF] attention gate enabled: %d/%d layers (%s)\n",
+                         n_gate_layers, out.n_layer,
+                         out.layers[0].attn_gate_per_head ? "per-head" : "per-channel");
+        }
+        out.context_kv_layer_norm =
+            meta_context_kv_layer_norm ||
+            n_gate_layers > 0 ||
+            !out.aux_hidden_norms.empty();
+        if (out.context_kv_layer_norm) {
+            std::fprintf(stderr,
+                         "[draft GGUF] context K/V layer input norm enabled\n");
         }
     }
 
