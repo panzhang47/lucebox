@@ -255,6 +255,19 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 #define MMID_META_PS (MMID_META_PT + MMID_GROUPED_MAX_PAIRS)
 #define MMID_META_INTS (MMID_META_PS + MMID_GROUPED_MAX_PAIRS)
 
+// [TAG_MMID_ADAPTIVE_K] per-token expert budget. The graph builder tags the
+// mmid ids tensor via ->extra with this struct; the prep kernel then drops
+// low-mass slots (cumulative router weight >= tau keeps), sentinels their ids
+// to -1 and renormalizes the kept weights in place. Idempotent across the
+// gate/up/down calls of one layer (-1 markers). Requires the grouped path for
+// every routed expert type (DFLASH_MMID_GROUPED=1, DFLASH_MMID_GROUPED_TYPES=7).
+struct mmid_gate_extra {
+    uint32_t magic;      // 0x4D474154 "MGAT"
+    float tau;
+    const ggml_tensor * weights;  // [n_used, n_tok] f32, combine weights
+};
+#define MMID_GATE_MAGIC 0x4D474154u
+
 static bool mmid_grouped_env() {
     static const bool on = []() {
         const char * e = std::getenv("DFLASH_MMID_GROUPED");
@@ -803,15 +816,52 @@ static __global__ void mul_mat_vec_q_moe(
 // share an expert, which is what makes the grouped kernel dedup weight reads.
 // Single block, O(np^2) rank sort: np <= 256, ~microseconds, capture-safe.
 static __global__ void mmid_group_prep(
-        const int32_t * __restrict__ ids, int32_t * __restrict__ meta,
-        const int n_slots, const int n_tok, const int ids_stride) {
+        int32_t * __restrict__ ids, int32_t * __restrict__ meta,
+        const int n_slots, const int n_tok, const int ids_stride,
+        float * __restrict__ gate_w, const int gate_w_stride, const float gate_tau) {
     __shared__ int sh_expert[MMID_GROUPED_MAX_PAIRS];
     const int np = n_slots*n_tok;
     const int i  = threadIdx.x;
+    // [TAG_MMID_ADAPTIVE_K] one thread per token: keep slots until cumulative
+    // combine weight >= tau, sentinel the rest, renormalize kept in place.
+    // Skips tokens that already contain a -1 (second/third mmid of the layer).
+    if (gate_w != nullptr && i < n_tok) {
+        int32_t * idrow = ids + i*ids_stride;
+        float   * wrow  = gate_w + i*gate_w_stride;
+        bool gated = false;
+        for (int j = 0; j < n_slots; ++j) {
+            gated = gated || (idrow[j] < 0);
+        }
+        if (!gated) {
+            float cum = 0.0f;
+            int   cut = n_slots;
+            float total = 0.0f;
+            for (int j = 0; j < n_slots; ++j) {
+                total += wrow[j];
+            }
+            for (int j = 0; j < n_slots; ++j) {
+                cum += wrow[j];
+                if (cum >= gate_tau*total) { cut = j + 1; break; }
+            }
+            if (cut < n_slots) {
+                const float inv = total/cum;
+                for (int j = 0; j < n_slots; ++j) {
+                    if (j < cut) {
+                        wrow[j] *= inv;
+                    } else {
+                        idrow[j] = -1;
+                        wrow[j]  = 0.0f;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
     int e = 0;
     if (i < np) {
         e = ids[(i % n_slots) + (i / n_slots)*ids_stride];
-        sh_expert[i] = e;
+        sh_expert[i] = e < 0 ? 0x7FFFFFFF : e;  // sentinels sort last
+        e = sh_expert[i];
     }
     __syncthreads();
     if (i < np) {
@@ -820,7 +870,7 @@ static __global__ void mmid_group_prep(
             const int ej = sh_expert[j];
             r += (ej < e || (ej == e && j < i)) ? 1 : 0;
         }
-        meta[MMID_META_GE + r] = e;
+        meta[MMID_META_GE + r] = e == 0x7FFFFFFF ? -1 : e;
         meta[MMID_META_PT + r] = i / n_slots;
         meta[MMID_META_PS + r] = i % n_slots;
     }
@@ -863,6 +913,15 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     const int slot      = meta[MMID_META_PS + p];
 
     const int row0             = c_rows_per_block*blockIdx.x;
+
+    // [TAG_MMID_ADAPTIVE_K] dropped slot: contribute exact zeros (combine
+    // weight is zeroed too, but dst must not hold garbage).
+    if (channel_x < 0) {
+        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            dst[slot*stride_channel_dst + tok*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
     const int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * warp_size / qi;
 
@@ -1518,11 +1577,7 @@ void ggml_cuda_mul_mat_vec_q(
     const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     char * src1_q8_d = nullptr;
-    // The src1->q8_1 quantization depends only on src0->type and src1's dims/strides,
-    // not on ids (ids only affects the matmul kernel's channel/dst strides below), so
-    // the memo is valid for MUL_MAT_ID too: gate/up and the shared expert re-quantize
-    // the same ffn_norm activation and can share one q8 buffer within an evaluation.
-    if (luce_q8_memo_on) {
+    if (luce_q8_memo_on && !ids) {
         for (const auto & e : ctx.luce_q8_memo) {
             if (e.src1_node == (const void *) src1 && e.src1_data == (const void *) src1_d &&
                 e.src0_type == (int) src0->type &&
@@ -1534,7 +1589,7 @@ void ggml_cuda_mul_mat_vec_q(
     }
     if (src1_q8_d == nullptr) {
         char * q8_dst;
-        if (luce_q8_memo_on) {
+        if (luce_q8_memo_on && !ids) {
             ggml_backend_cuda_context::luce_q8_memo_entry ent;
             ent.src1_node = (const void *) src1;
             ent.src1_data = (const void *) src1_d;
@@ -1582,8 +1637,18 @@ void ggml_cuda_mul_mat_vec_q(
         const int np = (int) (nchannels_dst*ncols_dst);
         GGML_ASSERT(np <= MMID_GROUPED_MAX_PAIRS && "DFLASH_MMID_GROUPED supports n_expert_used <= 16");
         ggml_cuda_pool_alloc<int32_t> mmid_meta(ctx.pool(), MMID_META_INTS);
+        float * gate_w = nullptr;
+        int gate_w_stride = 0;
+        float gate_tau = 0.0f;
+        const mmid_gate_extra * gx = (const mmid_gate_extra *) ids->extra;  // [TAG_MMID_ADAPTIVE_K]
+        if (gx != nullptr && gx->magic == MMID_GATE_MAGIC && gx->weights != nullptr && gx->weights->data != nullptr) {
+            gate_w        = (float *) gx->weights->data;
+            gate_w_stride = (int) (gx->weights->nb[1]/sizeof(float));
+            gate_tau      = gx->tau;
+        }
         mmid_group_prep<<<1, MMID_GROUPED_MAX_PAIRS, 0, stream>>>(
-            ids_d, mmid_meta.ptr, (int) nchannels_dst, (int) ncols_dst, (int) ids_stride);
+            (int32_t *) ids_d, mmid_meta.ptr, (int) nchannels_dst, (int) ncols_dst, (int) ids_stride,
+            gate_w, gate_w_stride, gate_tau);
         CUDA_CHECK(cudaGetLastError());
         if (mul_mat_vec_q_grouped_dispatch(
                 src0->type, src0->data, src1_q8_d, mmid_meta.ptr, fusion_local, dst_d,

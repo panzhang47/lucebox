@@ -17,6 +17,7 @@
 // is tested against our llama.cpp build_laguna (already verified to match HF
 // for 30+ tokens on B-tree prompt; see Lucebox/Laguna-XS.2-GGUF README).
 
+#include "../common/mmid_adaptive_k.h"
 #include "laguna_internal.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_router_graph.h"
@@ -387,7 +388,7 @@ static ggml_tensor * build_laguna_dense_ffn(ggml_context * ctx, ggml_tensor * cu
 // Forward decl for the full MoE block (defined further down).
 static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
                                                   const LagunaTargetWeights & w,
-                                                  const LagunaTargetLayer & L);
+                                                  const LagunaTargetLayer & L, int il);
 // Forward decl for the hybrid (offload) MoE block (defined further down).
 static ggml_tensor * build_laguna_moe_block_hybrid(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
                                                    const LagunaTargetWeights & w,
@@ -421,7 +422,7 @@ static ggml_tensor * build_laguna_moe_block(ggml_context * ctx, ggml_cgraph * gf
             hyb->storage->layers[(size_t)il], hyb->lut_all, hyb->vld_all, hyb->sel_all,
             il - hyb->dense_lead);
     }
-    return build_laguna_moe_block_full(ctx, gf, cur, w, L);
+    return build_laguna_moe_block_full(ctx, gf, cur, w, L, il);
 }
 
 // Phase 2.1: full MoE dispatch (sigmoid + score-correction bias + sum-norm +
@@ -429,7 +430,7 @@ static ggml_tensor * build_laguna_moe_block(ggml_context * ctx, ggml_cgraph * gf
 // the SIGMOID + WEIGHTS_NORM + EXP_PROBS_B configuration that Laguna uses.
 static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
                                                   const LagunaTargetWeights & w,
-                                                  const LagunaTargetLayer & L) {
+                                                  const LagunaTargetLayer & L, int il) {
     const int n_tokens = (int)cur->ne[1];
     const int n_expert = w.n_expert;
     const int n_used   = w.n_expert_used;
@@ -447,6 +448,8 @@ static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_cgraph
     ggml_tensor * selected   = router.selected;
     ggml_tensor * weights_2d = router.weights_2d;
     ggml_tensor * weights_3d = router.weights_3d;
+    // [TAG_MMID_ADAPTIVE_K] default dense list = Laguna DFlash capture layers.
+    mmid_adaptive_k_attach(selected, weights_2d, n_tokens, il, "1,13,25,33,39");
 
     // Per-expert SwiGLU via mul_mat_id.
     //   ffn_gate_exps: [n_embd, n_ff_exp, n_expert]
