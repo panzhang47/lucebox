@@ -174,8 +174,19 @@ bool LagunaBackend::init() {
                      "[laguna] auto-enabled head-major KV layout "
                      "(disable with DFLASH_LAGUNA_AUTO_HEAD_MAJOR=0)\n");
     }
+    // [TAG_SWA_RING] pooled mode: SWA layers on position rings sized for the
+    // sliding window + the largest batch this backend issues. Kill switch:
+    // DFLASH_LAGUNA_SWA_RING=0.
+    static const bool swa_ring_env = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_SWA_RING");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    const int swa_ring_rows =
+        (kvflash_tokens_ > 0 && !hybrid_mode_ && swa_ring_env)
+            ? std::max(2048, args_.chunk + w_.sliding_window + 64)
+            : 0;
     if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_,
-                                    kvflash_tokens_)) {
+                                    kvflash_tokens_, swa_ring_rows)) {
         std::fprintf(stderr, "cache failed: %s\n", dflash27b_last_error());
         free_laguna_target_weights(w_);
         ggml_backend_free(backend_); backend_ = nullptr;
@@ -296,7 +307,20 @@ bool LagunaBackend::kvflash_attach() {
     if (!kvflash_active()) return true;
     KvFlashConfig pc = kvflash_config();
     pc.pool_tokens = kvflash_tokens_;
-    if (!kvflash_pager_.attach(pc, cache_.attn_k, cache_.attn_v)) {
+    // [TAG_SWA_RING] SWA layers live on position rings outside the pool, so
+    // the pager only pages the full-attention layers' K/V.
+    std::vector<ggml_tensor *> pool_k = cache_.attn_k;
+    std::vector<ggml_tensor *> pool_v = cache_.attn_v;
+    if (cache_.swa_ring_rows > 0) {
+        pool_k.clear();
+        pool_v.clear();
+        for (int il = 0; il < w_.n_layer; ++il) {
+            if (!laguna_is_full_attn_layer(w_, il)) continue;
+            pool_k.push_back(cache_.attn_k[(size_t)il]);
+            pool_v.push_back(cache_.attn_v[(size_t)il]);
+        }
+    }
+    if (!kvflash_pager_.attach(pc, pool_k, pool_v)) {
         std::fprintf(stderr, "kvflash: pager attach failed (pool=%d)\n",
                      kvflash_tokens_);
         return false;
@@ -374,8 +398,16 @@ bool LagunaBackend::unpark(const std::string & what) {
                          "[laguna] auto-enabled head-major KV layout "
                          "(disable with DFLASH_LAGUNA_AUTO_HEAD_MAJOR=0)\n");
         }
+        static const bool unpark_swa_ring_env = []() {
+            const char * e = std::getenv("DFLASH_LAGUNA_SWA_RING");
+            return !(e && e[0] == '0' && e[1] == '\0');
+        }();
+        const int unpark_swa_ring =
+            (kvflash_tokens_ > 0 && !hybrid_mode_ && unpark_swa_ring_env)
+                ? std::max(2048, args_.chunk + w_.sliding_window + 64)
+                : 0;
         if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_,
-                                        kvflash_tokens_)) {
+                                        kvflash_tokens_, unpark_swa_ring)) {
             std::fprintf(stderr, "[unpark] cache: %s\n", dflash27b_last_error());
             return false;
         }
@@ -410,10 +442,13 @@ bool LagunaBackend::ensure_slot(int slot) {
 
 bool LagunaBackend::snapshot_save(int slot) {
     // kvflash: snapshots copy rows assuming identity layout, which breaks
-    // after the first page-out relocates a chunk.
-    if (kvflash_active() && !kvflash_pager_.is_identity()) {
+    // after the first page-out relocates a chunk. [TAG_SWA_RING] ring-cached
+    // SWA layers hold only the trailing window, so prefix snapshots are
+    // impossible there too.
+    if (kvflash_active() &&
+        (!kvflash_pager_.is_identity() || cache_.swa_ring_rows > 0)) {
         std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
-                             "chunks (page-table serialization not implemented)\n");
+                             "chunks or SWA layers are ring-cached\n");
         return false;
     }
     if (!ensure_slot(slot)) return false;
@@ -623,13 +658,37 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         (void)kvflash_alloc_span(0, committed);
     }
 
+    // [TAG_DRAFT_KV] drafter context-KV ring cache: compute the ctx-side
+    // K/V once per committed row instead of re-fusing the whole feature
+    // window every step (draft ~10ms -> ~3ms once the window fills).
+    // Kill switch: DFLASH_DRAFT_KV=0 restores the legacy one-shot graph.
+    constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
+    static const bool draft_kv_on = []() {
+        const char * e = std::getenv("DFLASH_DRAFT_KV");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    bool use_draft_kv = draft_kv_on && feature_mirror_.target_feat != nullptr;
+    if (use_draft_kv && draft_kv_.gf && draft_kv_.built_for != (const void *)&dw) {
+        draft_kv_free(draft_kv_);  // drafter variant switched; graph holds old weights
+    }
+    if (use_draft_kv && !draft_kv_.gf) {
+        const int kv_cap = std::min(feature_mirror_.cap,
+                                    std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max));
+        if (!draft_kv_init(draft_kv_, dw, draft_backend_, kv_cap, nullptr)) {
+            draft_kv_free(draft_kv_);
+            use_draft_kv = false;
+            std::fprintf(stderr,
+                "[laguna-spec] draft-kv init failed; using legacy draft path\n");
+        }
+    }
+
     auto t_dec0 = std::chrono::steady_clock::now();
     static const bool step_prof = std::getenv("DFLASH_LAGUNA_STEP_PROF") != nullptr;
     double prof_draft_ms = 0.0, prof_heads_ms = 0.0, prof_verify_ms = 0.0;
     // [TAG_FUSED_LOOP] blind-spot laps: commit = verify-end -> loop-top
     // (accept/commit/emit/feature-sync), build = loop-top -> draft-input
     // upload (noise embed on host, build_draft_step, feature copy).
-    double prof_commit_ms = 0.0, prof_build_ms = 0.0;
+    double prof_commit_ms = 0.0, prof_build_ms = 0.0, prof_dwait_ms = 0.0;
     auto prof_now = std::chrono::steady_clock::now();
     auto prof_lap = [&]() {
         auto t = std::chrono::steady_clock::now();
@@ -677,62 +736,94 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             return false;
         }
 
-        constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
-        const int ring_cap = feature_mirror_.cap;
-        const int draft_ctx = std::min(committed,
-            std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max)));
-        const int draft_start = committed - draft_ctx;
-        int mirror_slot0 = 0;
-        const bool use_mirror_view =
-            draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
+        ggml_tensor * draft_hidden = nullptr;
+        if (use_draft_kv) {
+            // [TAG_DRAFT_KV] append newly committed rows to the ctx-KV ring
+            // and refresh positions/masks; the step graph itself never
+            // rebuilds (fixed topology, CUDA-graph replay from step 2).
+            if (!draft_kv_begin_step(draft_kv_, dw, draft_backend_,
+                                     feature_mirror_, committed)) {
+                std::fprintf(stderr, "[laguna-spec] draft-kv step prep failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            ggml_backend_tensor_set(draft_kv_.inp_embed, noise_embed.data(), 0,
+                                    sizeof(float) * noise_embed.size());
+            if (step_prof) prof_build_ms += prof_lap();  // [TAG_FUSED_LOOP]
+            if (step_prof) {
+                ggml_backend_synchronize(draft_backend_);
+                prof_dwait_ms += prof_lap();
+            }
+            if (ggml_backend_graph_compute(draft_backend_, draft_kv_.gf) !=
+                GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[laguna-spec] draft-kv compute failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            draft_hidden = draft_kv_.hidden_states;
+        } else {
+            const int ring_cap = feature_mirror_.cap;
+            const int draft_ctx = std::min(committed,
+                std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max)));
+            const int draft_start = committed - draft_ctx;
+            int mirror_slot0 = 0;
+            const bool use_mirror_view =
+                draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
 
-        static const bool draft_pad = []() {
-            const char * e = std::getenv("DFLASH_LAGUNA_DRAFT_PAD");
-            return !(e && e[0] == '0' && e[1] == '\0');
-        }();
-        // [TAG_FUSED_LOOP] persistent draft graph: force the feature-COPY
-        // build (D2D peer copy, ~0.1ms) so the topology carries no per-step
-        // ring-view offsets and build_draft_step can skip the rebuild while
-        // ctx stays inside the same 64-aligned bucket. Kill: DFLASH_DRAFT_PERSIST=0.
-        static const bool draft_persist = []() {
-            const char * e = std::getenv("DFLASH_DRAFT_PERSIST");
-            return !(e && e[0] == '0' && e[1] == '\0');
-        }();
-        const bool want_view = use_mirror_view && !draft_persist;
-        if (!build_draft_step(draft_sg, dw, /*lm_head=*/nullptr, draft_backend_,
-                              draft_ctx, want_view ? &feature_mirror_ : nullptr,
-                              committed,
-                              std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max)),
-                              draft_pad)) {
-            std::fprintf(stderr, "[laguna-spec] draft build failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
-        }
-        if (!want_view &&
-            !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
-                                               draft_start, draft_ctx)) {
-            std::fprintf(stderr, "[laguna-spec] feature copy failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
-        }
+            static const bool draft_pad = []() {
+                const char * e = std::getenv("DFLASH_LAGUNA_DRAFT_PAD");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            // [TAG_FUSED_LOOP] persistent draft graph: force the feature-COPY
+            // build (D2D peer copy, ~0.1ms) so the topology carries no per-step
+            // ring-view offsets and build_draft_step can skip the rebuild while
+            // ctx stays inside the same 64-aligned bucket. Kill: DFLASH_DRAFT_PERSIST=0.
+            static const bool draft_persist = []() {
+                const char * e = std::getenv("DFLASH_DRAFT_PERSIST");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            const bool want_view = use_mirror_view && !draft_persist;
+            if (!build_draft_step(draft_sg, dw, /*lm_head=*/nullptr, draft_backend_,
+                                  draft_ctx, want_view ? &feature_mirror_ : nullptr,
+                                  committed,
+                                  std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max)),
+                                  draft_pad)) {
+                std::fprintf(stderr, "[laguna-spec] draft build failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            if (!want_view &&
+                !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
+                                                   draft_start, draft_ctx)) {
+                std::fprintf(stderr, "[laguna-spec] feature copy failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
 
-        ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                sizeof(float) * noise_embed.size());
-        const int kctx = (draft_sg.ctx_alloc > 0) ? draft_sg.ctx_alloc : draft_ctx;
-        pos_k.resize((size_t)kctx + (size_t)block_size);
-        for (int i = 0; i < block_size; i++) pos_q[(size_t)i] = draft_ctx + i;
-        for (int i = 0; i < kctx; i++) pos_k[(size_t)i] = (i < draft_ctx) ? i : 0;
-        for (int j = 0; j < block_size; j++) pos_k[(size_t)kctx + j] = draft_ctx + j;
-        if (step_prof) prof_build_ms += prof_lap();  // [TAG_FUSED_LOOP]
-        ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                sizeof(int32_t) * pos_q.size());
-        ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                sizeof(int32_t) * pos_k.size());
+            ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                    sizeof(float) * noise_embed.size());
+            const int kctx = (draft_sg.ctx_alloc > 0) ? draft_sg.ctx_alloc : draft_ctx;
+            pos_k.resize((size_t)kctx + (size_t)block_size);
+            for (int i = 0; i < block_size; i++) pos_q[(size_t)i] = draft_ctx + i;
+            for (int i = 0; i < kctx; i++) pos_k[(size_t)i] = (i < draft_ctx) ? i : 0;
+            for (int j = 0; j < block_size; j++) pos_k[(size_t)kctx + j] = draft_ctx + j;
+            if (step_prof) prof_build_ms += prof_lap();  // [TAG_FUSED_LOOP]
+            ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                    sizeof(int32_t) * pos_q.size());
+            ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                    sizeof(int32_t) * pos_k.size());
 
-        if (ggml_backend_graph_compute(draft_backend_, draft_sg.gf) != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "[laguna-spec] draft compute failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
+            // [TAG_FUSED_LOOP] split pending-work wait from execution when profiling
+            if (step_prof) {
+                ggml_backend_synchronize(draft_backend_);
+                prof_dwait_ms += prof_lap();
+            }
+            if (ggml_backend_graph_compute(draft_backend_, draft_sg.gf) != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[laguna-spec] draft compute failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            draft_hidden = draft_sg.hidden_states;
         }
 
         // [TAG_FUSED_LOOP] the 64KB draft-hidden D2H readback is lazy: the
@@ -742,7 +833,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         auto fetch_hidden = [&]() {
             if (hidden_on_host) return;
             local_hidden.resize((size_t)hidden * (size_t)q_len);
-            ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
+            ggml_backend_tensor_get(draft_hidden, local_hidden.data(), 0,
                                     sizeof(float) * local_hidden.size());
             hidden_on_host = true;
         };
@@ -779,7 +870,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                         last_tok, draft_tok,
                         cand_k, cand_k > 0 ? &cand_p : nullptr,
                         cand_k > 0 ? &cand_i : nullptr,
-                        draft_sg.hidden_states)) {
+                        draft_hidden)) {
                     used_domino = true;
                 }
             }
@@ -1138,12 +1229,13 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     if (step_prof && n_draft_steps > 0) {
         std::fprintf(stderr,
             "[step-prof] per-step ms: draft=%.2f heads=%.2f verify=%.2f "
-            "commit=%.2f build=%.2f other=%.2f total=%.2f (steps=%d)\n",
+            "commit=%.2f build=%.2f dwait=%.2f other=%.2f total=%.2f (steps=%d)\n",
             prof_draft_ms / n_draft_steps, prof_heads_ms / n_draft_steps,
             prof_verify_ms / n_draft_steps,
             prof_commit_ms / n_draft_steps, prof_build_ms / n_draft_steps,
+            prof_dwait_ms / n_draft_steps,
             (decode_s * 1000.0 - prof_draft_ms - prof_heads_ms - prof_verify_ms -
-             prof_commit_ms - prof_build_ms) / n_draft_steps,
+             prof_commit_ms - prof_build_ms - prof_dwait_ms) / n_draft_steps,
             decode_s * 1000.0 / n_draft_steps, n_draft_steps);
     }
     std::fprintf(stderr, "[laguna-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
@@ -1207,14 +1299,18 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
         return result;
     }
 
-    // kvflash: prefill rows land identity-mapped, so the prompt must fit the
-    // pool with one chunk of decode headroom (decode then evicts LRU live).
-    if (kvflash_active() &&
-        N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
-        std::fprintf(stderr, "[kvflash] prompt (%d) exceeds pool %d; raise "
-                             "--kvflash\n", N, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
-        return result;
+    // kvflash: prompts that fit the pool prefill identity-mapped. Larger
+    // prompts take the pooled path: pager-chunk-sized batches allocated via
+    // slot_for (evicting as the pool fills), slot-mapped KV writes and
+    // slot-space masks via kvflash_fill_rows_and_masks — same recipe as the
+    // qwen35 pooled prefill. Constant VRAM, linear time.
+    const bool kvf_paged = kvflash_active() &&
+        N > kvflash_tokens_ - kvflash_pager_.chunk_tokens();
+    if (kvf_paged) {
+        std::printf("[kvflash] pooled prefill: %d tokens through a %d-token "
+                    "pool (%d-token chunks, evicting)\n",
+                    N, kvflash_tokens_, kvflash_pager_.chunk_tokens());
+        std::fflush(stdout);
     }
 
     reset_laguna_target_cache(cache_);
@@ -1231,11 +1327,32 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     auto t_pf0 = std::chrono::steady_clock::now();
     std::vector<float> last_logits;
     bool ok = true;
-    const int n_chunks = (N + args_.chunk - 1) / args_.chunk;
+    // Pooled batches span multiple pager chunks (graphs replay, so big
+    // batches are pure win); each batch is chunk-aligned for slot_for.
+    const int pf_pool_batch = std::max(kvflash_pager_.chunk_tokens(),
+        (args_.chunk / std::max(1, kvflash_pager_.chunk_tokens())) *
+            std::max(1, kvflash_pager_.chunk_tokens()));
+    const int pf_chunk = kvf_paged ? pf_pool_batch : args_.chunk;
+    const int n_chunks = (N + pf_chunk - 1) / pf_chunk;
     for (int c = 0; c < n_chunks && ok; ++c) {
-        const int kv_start = c * args_.chunk;
-        const int n_tok    = std::min(args_.chunk, N - c * args_.chunk);
-        ok = kvflash_alloc_span(kv_start, n_tok) &&
+        const int kv_start = c * pf_chunk;
+        const int n_tok    = std::min(pf_chunk, N - c * pf_chunk);
+        if (kvf_paged) {
+            // Pooled path: allocate this chunk's slots up front, evicting the
+            // lowest-priority resident chunk once the pool fills. laguna_step
+            // then slot-maps the KV writes + masks via the shared helper.
+            for (int i = 0; i < n_tok && ok; i++) {
+                ok = kvflash_pager_.slot_for(kv_start + i) >= 0;
+            }
+            if (!ok) {
+                std::fprintf(stderr,
+                    "[kvflash] pooled prefill: slot alloc failed @%d\n", kv_start);
+                break;
+            }
+        } else {
+            ok = kvflash_alloc_span(kv_start, n_tok);
+        }
+        ok = ok &&
              laguna_step(backend_, w_, cache_,
                           embed_pf.data() + (size_t)kv_start * w_.n_embd,
                           n_tok, kv_start, no_mask, last_logits, kvf,
@@ -1249,9 +1366,9 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     // kvflash: snapshots copy rows [0, snap_pos) assuming identity layout,
     // which holds until the first page-out relocates a chunk.
     if (kvflash_active() && req.snap_slot >= 0 &&
-        !kvflash_pager_.is_identity()) {
+        (!kvflash_pager_.is_identity() || cache_.swa_ring_rows > 0)) {
         std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
-                             "chunks (page-table serialization not implemented)\n");
+                             "chunks or SWA layers are ring-cached\n");
     } else
     if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos <= N) {
         if (ensure_slot(req.snap_slot) &&
@@ -3232,6 +3349,7 @@ bool LagunaBackend::select_decode_draft(const std::string & name) {
 void LagunaBackend::free_decode_draft() {
     delete dflash_target_;
     dflash_target_ = nullptr;
+    draft_kv_free(draft_kv_);
     draft_feature_mirror_free(feature_mirror_);
     free_laguna_target_feat(cache_);
     for (LagunaDraftVariant & variant : draft_variants_) {
