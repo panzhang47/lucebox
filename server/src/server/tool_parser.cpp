@@ -29,6 +29,14 @@ namespace dflash::common {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
+static std::string trim_ws(const std::string & v) {
+    const char * ws = " \t\r\n";
+    const size_t a = v.find_first_not_of(ws);
+    if (a == std::string::npos) return std::string();
+    const size_t b = v.find_last_not_of(ws);
+    return v.substr(a, b - a + 1);
+}
+
 static std::string generate_call_id() {
     static std::mutex rng_mu;
     static std::mt19937_64 rng(std::random_device{}());
@@ -605,14 +613,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             // bodies to the Qwen patterns below.
             if (body.find("<function") == std::string::npos &&
                 body.find('{') == std::string::npos) {
-                auto trim = [](std::string v) {
-                    const char * ws = " \t\r\n";
-                    const size_t a = v.find_first_not_of(ws);
-                    if (a == std::string::npos) return std::string();
-                    const size_t b = v.find_last_not_of(ws);
-                    return v.substr(a, b - a + 1);
-                };
-                std::string name = trim(
+                std::string name = trim_ws(
                     first_key == std::string::npos ? body : body.substr(0, first_key));
                 if (!name.empty() && name.find('<') == std::string::npos) {
                     const json props = find_tool_properties(tools, name);
@@ -622,13 +623,13 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                         const size_t kend = body.find("</arg_key>", kpos);
                         if (kend == std::string::npos) break;
                         const std::string key =
-                            trim(body.substr(kpos + 9, kend - (kpos + 9)));
+                            trim_ws(body.substr(kpos + 9, kend - (kpos + 9)));
                         const size_t vpos = body.find("<arg_value>", kend);
                         if (vpos == std::string::npos) break;
                         const size_t vend = body.find("</arg_value>", vpos);
                         if (vend == std::string::npos) break;
                         const std::string val =
-                            trim(body.substr(vpos + 11, vend - (vpos + 11)));
+                            trim_ws(body.substr(vpos + 11, vend - (vpos + 11)));
                         if (!key.empty()) {
                             args[key] = convert_param_value(val, key, props);
                         }
@@ -672,15 +673,8 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                 if (vpos == std::string::npos) break;
                 const size_t vend = text.find("</arg_value>", vpos);
                 if (vend == std::string::npos) break;
-                auto trim = [](std::string v) {
-                    const char * ws = " \t\r\n";
-                    const size_t a = v.find_first_not_of(ws);
-                    if (a == std::string::npos) return std::string();
-                    const size_t b = v.find_last_not_of(ws);
-                    return v.substr(a, b - a + 1);
-                };
-                const std::string key = trim(text.substr(kpos + 9, kend - (kpos + 9)));
-                const std::string val = trim(text.substr(vpos + 11, vend - (vpos + 11)));
+                const std::string key = trim_ws(text.substr(kpos + 9, kend - (kpos + 9)));
+                const std::string val = trim_ws(text.substr(vpos + 11, vend - (vpos + 11)));
                 if (!key.empty()) args[key] = convert_param_value(val, key, props);
                 span_end = vend + 12;
                 // consume whitespace between pairs, then check for the next key
