@@ -42,6 +42,10 @@ struct StepGraph {
     // When >0, the draft graph was built with the ctx dimension padded to this
     // size (stable topology for CUDA-graph replay); noise keys start here.
     int             ctx_alloc = 0;
+    // True when the built topology reads features through a mirror ring VIEW
+    // (no target_hidden_cat input tensor). A view-built graph must never be
+    // reused by the copy-mode persistent fast path.
+    bool            built_view = false;
     ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
     // [n_tokens,n_head_kv] i64; step-invariant KV write (carries kv_start). Null on non-graph paths.
     ggml_tensor *   kv_write_rows = nullptr;
@@ -71,6 +75,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.target_hidden_cat = sg.positions_k = nullptr;
     sg.pad_mask_full = nullptr;
     sg.ctx_alloc = 0;
+    sg.built_view = false;
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
     sg.kv_write_rows = nullptr;

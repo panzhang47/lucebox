@@ -3265,6 +3265,14 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // [TAG_FUSED_LOOP] with GGML_CUDA_GRAPH_STATS, name the first node
+            // whose properties changed — the reason a graph re-captures.
+            static const bool dbg = getenv("GGML_CUDA_GRAPH_STATS") != nullptr;
+            if (dbg && !res) {
+                GGML_LOG_INFO("[graph-mismatch] key=%p node=%d op=%s name=%s\n",
+                    graph_key, i, ggml_op_name(cgraph->nodes[i]->op),
+                    cgraph->nodes[i]->name);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4380,7 +4388,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             if (use_cuda_graph && !cuda_graph_update_required) g->stat_replay++;
             else if (use_cuda_graph) g->stat_capture++;
             else g->stat_eager++;
-            if (g->stat_total % 200 == 0) {
+            static const int stats_every = [](){
+                const char * e = getenv("GGML_CUDA_GRAPH_STATS_EVERY");
+                const int v = e ? atoi(e) : 200;
+                return v > 0 ? v : 200;  // guard % 0 on malformed input
+            }();
+            if (g->stat_total % stats_every == 0) {
                 GGML_LOG_INFO("[cuda-graph-stats] key=%p n_nodes=%d total=%llu replay=%llu capture=%llu eager=%llu enabled=%d\n",
                     graph_key, cgraph->n_nodes,
                     (unsigned long long)g->stat_total, (unsigned long long)g->stat_replay,

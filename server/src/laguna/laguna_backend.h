@@ -11,6 +11,7 @@
 #include "laguna_dflash_target.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
+#include "common/dflash_draft_kv.h"
 #include "placement/placement_config.h"
 #include "qwen3_drafter.h"
 #include "kvflash_pager.h"
@@ -109,6 +110,10 @@ private:
     DraftWeights *                              active_dw_ = nullptr;
     std::string                                 default_draft_variant_ = "base";
     DraftFeatureMirror                          feature_mirror_{};
+    // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init on first spec
+    // decode; kill with DFLASH_DRAFT_KV=0). Replaces the per-step full-window
+    // K/V recompute once the feature window fills.
+    DraftKvState                                draft_kv_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
     bool                                        draft_parked_ = false;
     // [TAG_LAGUNA_VERIFY_WIDTH] EWMA of the accepted block length, persisted

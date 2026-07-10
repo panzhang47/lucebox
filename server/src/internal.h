@@ -240,12 +240,14 @@ struct DraftLayer {
     ggml_tensor * wk;
     ggml_tensor * wv;
     ggml_tensor * wo;
+    ggml_tensor * attn_gate = nullptr;  // optional Laguna XS 2.1 attention gate
     ggml_tensor * q_norm;
     ggml_tensor * k_norm;
     ggml_tensor * w_gate;
     ggml_tensor * w_up;
     ggml_tensor * w_down;
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
+    bool attn_gate_per_head = false;
 };
 
 struct DraftDominoWeights {
@@ -284,6 +286,8 @@ struct DraftWeights {
 
     ggml_tensor *          fc          = nullptr;   // [5*hidden, hidden]
     ggml_tensor *          hidden_norm = nullptr;   // [hidden]
+    std::vector<ggml_tensor *> aux_hidden_norms;    // optional [hidden] per captured target layer
+    bool context_kv_layer_norm = false;             // Laguna DFlash: per-layer input norm before context K/V
     std::vector<DraftLayer> layers;                 // size = n_layer
     ggml_tensor *          out_norm    = nullptr;   // [hidden]
 

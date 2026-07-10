@@ -1,3 +1,4 @@
+#include "../common/mmid_adaptive_k.h"
 #include "qwen35moe_ffn.h"
 
 #include "qwen35_ops.h"
@@ -56,6 +57,8 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
     if (w.expert_weights_scale != 0.0f && w.expert_weights_scale != 1.0f) {
         weights = ggml_scale(ctx, weights, w.expert_weights_scale);
     }
+
+    mmid_adaptive_k_attach(selected, weights, n_tokens, -1, nullptr);  // [TAG_MMID_ADAPTIVE_K]
 
     Qwen35MoeRouterOutputs out;
     out.selected = selected;
