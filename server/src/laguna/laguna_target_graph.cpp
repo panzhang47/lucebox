@@ -1475,7 +1475,7 @@ bool laguna_step(
         return true;
     }
 
-    // [TAG_PREFILL_PROF] batch-path sub-phase laps: DFLASH_LAGUNA_PREFILL_PROF=1.
+    // [TAG_PREFILL_PROF] batch-path sub-phase laps: DFLASH_PROF=prefill.
     // build = graph rebuild+alloc, fill = host mask/row fills, up = tensor_set
     // uploads, gpu = graph_compute, read = logit/argmax readback.
     static const bool g_pfprof = dflash_prof_enabled("prefill");
@@ -1878,7 +1878,7 @@ bool laguna_verify_batch(
     ggml_tensor * argmax = S.argmax;
     const int swa_ring = cache.swa_ring_rows;
 
-    // [TAG_VERIFY_PROF] sub-phase laps: DFLASH_LAGUNA_VERIFY_PROF=1.
+    // [TAG_VERIFY_PROF] sub-phase laps: DFLASH_PROF=verify.
     // prep = stage+embed/pos fills, mask = kvflash rows+mask fill+memcpy,
     // upwait = sync after async uploads (isolates upload cost from compute),
     // gpu = graph_compute, read = argmax/logits readback.

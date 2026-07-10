@@ -66,9 +66,13 @@ inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weight
                 char * end = nullptr;
                 const long v = std::strtol(tok.c_str(), &end, 10);
                 if (end == tok.c_str() || *end != '\0') {
-                    std::fprintf(stderr, "[adaptive-k] ignoring malformed "
-                                         "DFLASH_ADAPTIVE_K_DENSE entry \"%s\"\n",
-                                 tok.c_str());
+                    static bool warned_bad_dense = false;
+                    if (!warned_bad_dense) {
+                        warned_bad_dense = true;
+                        std::fprintf(stderr, "[adaptive-k] ignoring malformed "
+                                             "DFLASH_ADAPTIVE_K_DENSE entry \"%s\"\n",
+                                     tok.c_str());
+                    }
                 } else if ((int) v == il) {
                     return;
                 }
@@ -80,8 +84,11 @@ inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weight
     // The extra must outlive graph evals, and builds run repeatedly in a
     // server (ggml_new_tensor zeroes ->extra even when the persistent arena
     // hands back the same address). Keep one allocation per distinct tensor
-    // address in a process-lifetime pool: bounded by the arenas' stable
-    // addresses instead of leaking one allocation per rebuild.
+    // address in a process-lifetime pool: with persistent-arena builders the
+    // address set is small and stable, so this bounds the former
+    // one-allocation-per-rebuild leak. Unsynchronized on purpose: graph
+    // builds are single-threaded (same assumption as the thread_local
+    // builder arenas).
     static std::unordered_map<const ggml_tensor *, mmid_gate_extra *> pool;
     mmid_gate_extra *& gx = pool[ids];
     if (gx == nullptr) gx = new mmid_gate_extra{MMID_GATE_MAGIC, tau, weights};
