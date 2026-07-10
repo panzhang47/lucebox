@@ -364,6 +364,32 @@ bool DeepSeek4Backend::init() {
             if (load_deepseek4_dspark_drafter(dp, backend_, *spec_drafter_)) {
                 spec_enabled_ = true;
                 std::fprintf(stderr, "[deepseek4] DSpark spec-decode ENABLED (drafter=%s)\n", dp);
+                const char * ipc_bin = std::getenv("DFLASH_DS4_DRAFT_IPC_BIN");
+                if (ipc_bin && *ipc_bin) {
+                    const char * ipc_work = std::getenv("DFLASH_DS4_DRAFT_IPC_WORK_DIR");
+                    int ipc_gpu = 0;
+                    if (const char * gpu = std::getenv("DFLASH_DS4_DRAFT_IPC_GPU")) {
+                        ipc_gpu = std::max(0, std::atoi(gpu));
+                    }
+                    spec_remote_drafter_ = std::make_unique<DFlashDraftIpcClient>(
+                        w_.n_embd, spec_drafter_->block_size,
+                        spec_drafter_->n_target_layers);
+                    if (!spec_remote_drafter_->start(
+                            ipc_bin, dp, ipc_gpu, w_.n_swa,
+                            ipc_work && *ipc_work ? ipc_work : "",
+                            BackendIpcMode::DeepSeek4DSparkDraft)) {
+                        std::fprintf(stderr,
+                                     "[deepseek4] DSpark remote draft IPC failed; using local draft\n");
+                        spec_remote_drafter_.reset();
+                        if (env_flag_enabled("DFLASH_DS4_DRAFT_IPC_REQUIRED")) {
+                            return false;
+                        }
+                    } else {
+                        std::fprintf(stderr,
+                                     "[deepseek4] DSpark remote draft IPC ENABLED gpu=%d\n",
+                                     ipc_gpu);
+                    }
+                }
             } else {
                 std::fprintf(stderr, "[deepseek4] DSpark drafter load FAILED: %s\n",
                              deepseek4_dspark_last_error());
@@ -771,10 +797,14 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
             const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
             std::vector<int32_t> spec_toks;
-            run_deepseek4_dspark_spec_decode(backend_, w_, cache_, *spec_drafter_,
-                committed, seed, req.n_gen - 1,
-                win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
-                spec_toks, &accept_rate);
+            if (!run_deepseek4_dspark_spec_decode(
+                    backend_, w_, cache_, *spec_drafter_,
+                    committed, seed, req.n_gen - 1,
+                    win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
+                    spec_toks, &accept_rate, spec_remote_drafter_.get())) {
+                result.error = "spec decode";
+                return result;
+            }
             for (int t : spec_toks) io.emit(t);
             gen.insert(gen.end(), spec_toks.begin(), spec_toks.end());
         }
@@ -843,6 +873,8 @@ bool DeepSeek4Backend::handle_compress(const std::string & line,
 }
 
 void DeepSeek4Backend::free_drafter() {
+    spec_remote_drafter_.reset();
+    if (spec_drafter_) free_deepseek4_dspark_drafter(*spec_drafter_);
     spec_drafter_.reset();
     spec_enabled_ = false;
     spec_feat_window_.clear();
@@ -859,6 +891,7 @@ void DeepSeek4Backend::maybe_save_routing_stats() {
 
 void DeepSeek4Backend::shutdown() {
     maybe_save_routing_stats();
+    free_drafter();
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_deepseek4_snapshot(snapshots_[i]);
     }

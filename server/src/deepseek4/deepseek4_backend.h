@@ -14,6 +14,7 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "common/dflash_draft_ipc.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -80,6 +81,7 @@ private:
     // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
     bool                           spec_enabled_ = false;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
+    std::unique_ptr<DFlashDraftIpcClient> spec_remote_drafter_;
     std::vector<float>             spec_feat_window_;
 
     // Prefill prompt tokens in chunks, return absolute committed position.

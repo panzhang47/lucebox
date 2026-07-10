@@ -29,10 +29,13 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
 namespace dflash::common {
+
+class DFlashDraftIpcClient;
 
 // The drafter weights. `core` reuses DeepSeek4Weights for the n_layer decoder
 // blocks + per-layer tensors + metadata + out_norm + output_hc_* tail; its
@@ -136,6 +139,15 @@ bool run_deepseek4_dspark_spec_decode(
         const float * prompt_feature_window,  // [n_target_layers*n_embd * win_len] captured during prefill
         int win_len,
         std::vector<int32_t> & out_tokens,
-        float * accept_rate_out);
+        float * accept_rate_out,
+        DFlashDraftIpcClient * remote_draft = nullptr);
+
+int run_deepseek4_dspark_draft_ipc_daemon(const char * draft_path,
+                                           int ring_cap,
+                                           int draft_gpu,
+                                           int stream_fd,
+                                           int payload_fd,
+                                           int shared_payload_fd = -1,
+                                           size_t shared_payload_bytes = 0);
 
 }  // namespace dflash::common
