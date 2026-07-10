@@ -24,6 +24,7 @@
 #include "deepseek4_internal.h"
 #include "internal.h"
 #include "common/dspark_head.h"
+#include "common/dflash_draft_ipc.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -364,7 +365,8 @@ bool run_deepseek4_dspark_spec_decode(
         const float * prompt_feature_window,
         int win_len,
         std::vector<int32_t> & out_tokens,
-        float * accept_rate_out) {
+        float * accept_rate_out,
+        DFlashDraftIpcClient * remote_draft) {
     const int n_embd = target_w.n_embd;
     const int n_tgt = drafter.n_target_layers;
     const int block = drafter.block_size;
@@ -429,6 +431,18 @@ bool run_deepseek4_dspark_spec_decode(
     }
     int feat_count = win_have;   // number of valid feature columns ending at committed-1
 
+    if (remote_draft && remote_draft->active() && win_have > 0) {
+        const int start_pos = committed - win_have;
+        if (!remote_draft->send_feature_block(
+                start_pos, win_have, feat_win.data(),
+                (size_t) win_have * feat_row)) {
+            std::fprintf(stderr,
+                         "[ds4-spec] remote draft prompt feature upload failed\n");
+            ggml_backend_free(snap_backend);
+            return false;
+        }
+    }
+
     auto push_feature = [&](const float * col) {
         // Shift-append one feature column (keep last n_swa).
         if (feat_count >= n_swa) {
@@ -468,11 +482,16 @@ bool run_deepseek4_dspark_spec_decode(
             if (!target.embed_tokens(noise_ids.data(), block, noise_embed.data())) break;
 
             // Drafter forward -> block normed hidden states.
-            if (!deepseek4_dspark_draft_forward(backend, drafter, noise_embed.data(),
-                                                ctx_len > 0 ? feat_win.data() : nullptr,
-                                                ctx_len, pos, local_hidden)) {
+            const bool draft_ok = remote_draft && remote_draft->active()
+                ? remote_draft->propose(pos, ctx_len, noise_embed, local_hidden)
+                : deepseek4_dspark_draft_forward(
+                    backend, drafter, noise_embed.data(),
+                    ctx_len > 0 ? feat_win.data() : nullptr,
+                    ctx_len, pos, local_hidden);
+            if (!draft_ok) {
                 std::fprintf(stderr, "[ds4-spec] drafter forward failed\n");
-                break;
+                ggml_backend_free(snap_backend);
+                return false;
             }
         }
         tm_draft += spec_ms_since(t0);
@@ -617,6 +636,17 @@ bool run_deepseek4_dspark_spec_decode(
         t0 = SpecClock::now();
         const std::vector<float> & feats = target.last_features();
         const int fN = full_snap ? target.last_verify_n() : accept;
+        if (remote_draft && remote_draft->active() && fN > 0) {
+            const size_t feature_count = (size_t) fN * feat_row;
+            if (feats.size() < feature_count ||
+                !remote_draft->send_feature_block(
+                    pos, fN, feats.data(), feature_count)) {
+                std::fprintf(stderr,
+                             "[ds4-spec] remote draft feature update failed\n");
+                ggml_backend_free(snap_backend);
+                return false;
+            }
+        }
         for (int i = 0; i < fN; i++) push_feature(feats.data() + (size_t) i * feat_row);
         tm_feat += spec_ms_since(t0);
 

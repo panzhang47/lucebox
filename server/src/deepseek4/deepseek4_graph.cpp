@@ -4593,6 +4593,8 @@ bool deepseek4_step_layer_range(
     }
     std::vector<float> fused_debug_logits;
     if (n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
+        !(verify_hooks && verify_hooks->capture_layer_ids &&
+          verify_hooks->capture_out) &&
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_decode_enabled()) {
         const int rc = ds4_try_fused_decode_step(
             fused_decode_graph_cache, backend, w, cache, hc_layer_weights_range,
@@ -4646,6 +4648,8 @@ bool deepseek4_step_layer_range(
         reuse_decode_graphs &&
         ds4_backend_is_gpu(backend) &&
         backend_decode_hc_supported &&
+        !(verify_hooks && verify_hooks->capture_layer_ids &&
+          verify_hooks->capture_out) &&
         !ds4_env_flag("DFLASH_DS4_HC_CPU");
     const bool use_backend_decode_hc_direct = use_backend_decode_hc && ds4_backend_is_hip(backend);
     const bool use_backend_decode_hc_graph =
