@@ -84,7 +84,19 @@ static json convert_param_value(const std::string & val, const std::string & key
     const auto & cfg = props[key];
     std::string ptype = "string";
     if (cfg.is_object() && cfg.contains("type")) {
-        ptype = cfg["type"].get<std::string>();
+        const auto & t = cfg["type"];
+        if (t.is_string()) {
+            ptype = t.get<std::string>();
+        } else if (t.is_array()) {
+            // JSON Schema allows "type": ["string","null"]; take the first
+            // non-null string entry instead of throwing.
+            for (const auto & e : t) {
+                if (e.is_string() && e.get<std::string>() != "null") {
+                    ptype = e.get<std::string>();
+                    break;
+                }
+            }
+        }
     }
 
     // string types
@@ -611,8 +623,12 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             // Only claim bodies in the Laguna shape: bare name then arg tags
             // (or a bare name alone for zero-arg calls); leave <function=...>
             // bodies to the Qwen patterns below.
+            // Laguna bodies are `NAME<arg_key>...` (values may contain JSON —
+            // the template serializes non-string args via tojson). Only leave
+            // <function=...> and pure-JSON bodies to the Qwen patterns.
             if (body.find("<function") == std::string::npos &&
-                body.find('{') == std::string::npos) {
+                (first_key != std::string::npos ||
+                 body.find('{') == std::string::npos)) {
                 std::string name = trim_ws(
                     first_key == std::string::npos ? body : body.substr(0, first_key));
                 if (!name.empty() && name.find('<') == std::string::npos) {

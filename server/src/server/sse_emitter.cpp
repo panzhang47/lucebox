@@ -547,8 +547,43 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         default: break;
         }
     } else if (mode_ == StreamMode::CONTENT && !window_.empty()) {
-        accumulated_content_ += window_;
-        emit_content_delta(out, window_);
+        // Zero-argument Laguna calls in the stripped form are just the bare
+        // declared tool name at end of output (the <tool_call> wrapper is
+        // special tokens the detokenizer removed, and with no <arg_key> there
+        // is no trigger). If the output ENDS on exactly a declared tool name,
+        // treat it as a zero-arg call instead of trailing prose.
+        bool zero_arg_call = false;
+        if (has_request_tools(tools_)) {
+            auto is_ident = [](char c) {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '_' || c == '-';
+            };
+            size_t name_start = window_.size();
+            while (name_start > 0 && is_ident(window_[name_start - 1])) name_start--;
+            const std::string tail = window_.substr(name_start);
+            if (!tail.empty()) {
+                for (const auto & t : tools_) {
+                    if (t.contains("function") && t["function"].value("name", "") == tail) {
+                        std::string pre = window_.substr(0, name_start);
+                        if (!pre.empty()) {
+                            accumulated_content_ += pre;
+                            emit_content_delta(out, pre);
+                        }
+                        // Re-wrap in the canonical form the parser's wrapped
+                        // path accepts (it emits name-only bodies as
+                        // zero-argument calls).
+                        tool_buffer_ = "<tool_call>" + tail + "</tool_call>";
+                        mode_ = StreamMode::TOOL_BUFFER;
+                        zero_arg_call = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!zero_arg_call) {
+            accumulated_content_ += window_;
+            emit_content_delta(out, window_);
+        }
     } else if (mode_ == StreamMode::TOOL_BUFFER) {
         tool_buffer_ += window_;
     }
