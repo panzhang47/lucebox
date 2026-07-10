@@ -1127,22 +1127,11 @@ int main(int argc, char ** argv) {
     sconfig.ddtree_budget = bargs.ddtree_budget;
     sconfig.speculative_enabled = bargs.ddtree_mode;
     sconfig.target_sharding     = bargs.device.is_layer_split();
-    // KV type: report the operator's choice if set, else the auto-default
-    // the daemon picks. Matches the printed table above.
-    sconfig.kv_cache_k = cache_type_k.empty()
-#ifdef GGML_USE_HIP
-        ? "q4_0"
-#else
-        ? (sconfig.max_ctx > 6144 ? "tq3_0" : "q4_0")
-#endif
-        : cache_type_k;
-    sconfig.kv_cache_v = cache_type_v.empty()
-#ifdef GGML_USE_HIP
-        ? "q4_0"
-#else
-        ? (sconfig.max_ctx > 6144 ? "tq3_0" : "q4_0")
-#endif
-        : cache_type_v;
+    // KV type: report the operator's choice if set, else the family default
+    // the backend resolves (the tq3_0 auto policy was removed; laguna uses
+    // q8_0, base default q4_0). Matches the printed table above.
+    sconfig.kv_cache_k = cache_type_k.empty() ? "family default" : cache_type_k;
+    sconfig.kv_cache_v = cache_type_v.empty() ? "family default" : cache_type_v;
     sconfig.runtime_backend =
 #ifdef GGML_USE_HIP
         "hip";
