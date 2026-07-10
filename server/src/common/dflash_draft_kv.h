@@ -32,6 +32,11 @@
 namespace dflash::common {
 
 struct DraftKvState {
+    DraftKvState() = default;
+    // Owns raw ggml contexts/buffers/graphs: copying would double-free.
+    DraftKvState(const DraftKvState &) = delete;
+    DraftKvState & operator=(const DraftKvState &) = delete;
+
     // geometry
     int cap = 0;         // ctx ring slots (== drafter feature window cap)
     int q_len = 0;       // noise block size

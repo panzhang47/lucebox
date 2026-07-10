@@ -1797,6 +1797,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     bool * degenerate_close_out) {
     out_accept_rate = 0.0f;
     out_spec_ran    = false;
+    // [TAG_DRAFT_KV] the drafter ring persists across requests but its rows
+    // belong to the previous conversation; start every request empty (the
+    // first begin_step bulk-appends the live window from the feature mirror).
+    if (draft_kv_.gf) draft_kv_reset(draft_kv_);
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.

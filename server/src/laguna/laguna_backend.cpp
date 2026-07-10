@@ -681,6 +681,10 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 "[laguna-spec] draft-kv init failed; using legacy draft path\n");
         }
     }
+    // The ring persists across requests but its rows belong to the previous
+    // conversation; start every request from an empty ring (the first
+    // begin_step bulk-appends the live window from the feature mirror).
+    if (use_draft_kv) draft_kv_reset(draft_kv_);
 
     auto t_dec0 = std::chrono::steady_clock::now();
     static const bool step_prof = std::getenv("DFLASH_LAGUNA_STEP_PROF") != nullptr;

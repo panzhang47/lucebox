@@ -152,7 +152,7 @@ bool build_draft_step(
     // refresh the two ctx_len-dependent masks. Feature contents, positions
     // and noise embeds are re-uploaded by the caller every step regardless,
     // and the pad feature rows beyond ctx_len were zeroed at bucket build.
-    if (sg.gf && sg.ctx_alloc > 0 && !mirror && pad_ctx &&
+    if (sg.gf && sg.ctx_alloc > 0 && !sg.built_view && !mirror && pad_ctx &&
         sg.ctx_alloc == ((ctx_len + 63) & ~63)) {
         const int q_len     = dw.block_size;
         const int ctx_alloc = sg.ctx_alloc;
@@ -243,6 +243,7 @@ bool build_draft_step(
         return false;
     }
     sg.ctx_alloc = do_pad ? ctx_alloc : 0;
+    sg.built_view = use_view;
 
     if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) {
         return false;

@@ -293,6 +293,11 @@ bool draft_kv_begin_step(DraftKvState & st,
                                 sizeof(uint16_t) * mask_elems);
     }
     if (st.mask_swa) {
+        // The window is anchored at `committed` for ALL noise rows on purpose:
+        // this replicates the legacy one-shot drafter graph, which windows the
+        // ctx via a single view [ctx_len - swa_window, ctx_len) shared by every
+        // query row. A per-row lower bound would change the trained drafter's
+        // attention pattern (and measured acceptance).
         const int eff_win = (dw.swa_window > 0 && win > dw.swa_window)
                                 ? dw.swa_window : win;
         const int swa_lo = committed - eff_win;
