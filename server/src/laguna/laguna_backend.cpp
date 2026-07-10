@@ -78,6 +78,13 @@ static void resolve_laguna_kv_types(const LagunaBackendArgs & args,
         dflash::validate_kv_pair_or_abort(k_type, v_type, "[laguna]");
         std::fprintf(stderr, "[laguna] KV cache types overridden: K=%s V=%s\n",
                      dflash::kv_type_name(k_type), dflash::kv_type_name(v_type));
+        if (k_type == GGML_TYPE_TQ3_0 || v_type == GGML_TYPE_TQ3_0 ||
+            k_type == GGML_TYPE_Q4_0  || v_type == GGML_TYPE_Q4_0) {
+            std::fprintf(stderr,
+                "[laguna] WARNING: tq3_0/q4_0 KV caches are known to GARBLE "
+                "laguna output. Use q8_0 (the default) unless you are "
+                "debugging quantization itself.\n");
+        }
     }
 }
 

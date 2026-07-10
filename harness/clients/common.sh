@@ -51,11 +51,16 @@ LLAMA_UPSTREAM_PORT="${LLAMA_UPSTREAM_PORT:-$((PORT + 1))}"
 MAX_CTX="${MAX_CTX:-16384}"
 VERIFY_MODE="${VERIFY_MODE:-seq}"
 BUDGET="${BUDGET:-22}"
-FA_WINDOW="${FA_WINDOW:-2048}"
-CACHE_TYPE_K="${CACHE_TYPE_K:-tq3_0}"
-CACHE_TYPE_V="${CACHE_TYPE_V:-tq3_0}"
-LLAMA_CACHE_TYPE_K="${LLAMA_CACHE_TYPE_K:-$CACHE_TYPE_K}"
-LLAMA_CACHE_TYPE_V="${LLAMA_CACHE_TYPE_V:-$CACHE_TYPE_V}"
+# FA_WINDOW: 0 = full attention. A finite window is known to break tool
+# calling (Qwen3.6) - only set it explicitly for experiments.
+FA_WINDOW="${FA_WINDOW:-0}"
+# CACHE_TYPE_K/V: empty = let the server pick the model family's default
+# (qwen auto-selects tq3_0 above 6K ctx; laguna requires q8_0 - forcing
+# tq3_0/q4_0 on laguna garbles its output). Set explicitly to experiment.
+CACHE_TYPE_K="${CACHE_TYPE_K:-}"
+CACHE_TYPE_V="${CACHE_TYPE_V:-}"
+LLAMA_CACHE_TYPE_K="${LLAMA_CACHE_TYPE_K:-${CACHE_TYPE_K:-q8_0}}"
+LLAMA_CACHE_TYPE_V="${LLAMA_CACHE_TYPE_V:-${CACHE_TYPE_V:-q8_0}}"
 MAX_TOKENS="${MAX_TOKENS:-2048}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 
@@ -155,9 +160,10 @@ start_dflash_native_server() {
   if [[ -n "$FA_WINDOW" ]] && [[ "$FA_WINDOW" != "0" ]]; then
     fa_args=(--fa-window "$FA_WINDOW")
   fi
-  # Export KV cache type env vars for the C++ server to pick up.
-  export DFLASH27B_KV_K="$CACHE_TYPE_K"
-  export DFLASH27B_KV_V="$CACHE_TYPE_V"
+  # Export KV cache type env vars for the C++ server to pick up (only when
+  # explicitly requested: the per-axis envs override family defaults).
+  if [[ -n "$CACHE_TYPE_K" ]]; then export DFLASH27B_KV_K="$CACHE_TYPE_K"; fi
+  if [[ -n "$CACHE_TYPE_V" ]]; then export DFLASH27B_KV_V="$CACHE_TYPE_V"; fi
   "$DFLASH_SERVER_BIN" "$TARGET" \
     "${draft_args[@]}" \
     --host "$HOST" \

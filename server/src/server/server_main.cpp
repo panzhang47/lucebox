@@ -259,7 +259,7 @@ static void print_usage(const char * prog) {
 #ifdef GGML_USE_HIP
         "                         Default: q4_0 (HIP builds; tq3_0 fattn unsupported)\n"
 #else
-        "                         Default: tq3_0 when max_ctx>6144, else q4_0\n"
+        "                         Default: per model family (laguna q8_0, else q4_0)\n"
 #endif
         "\n"
         "PFlash (speculative prefill compression):\n"
@@ -700,14 +700,10 @@ int main(int argc, char ** argv) {
         setenv("DFLASH27B_KV_V", cache_type_v.c_str(), 1);
     }
 
-    // Auto-select TQ3_0 KV cache for large contexts (saves ~40% VRAM).
-    // Q4_0 remains default for short contexts where quality matters more.
-    // HIP build skips this: tq3_0 fattn unsupported (ggml-cuda/fattn.cu).
-#ifndef GGML_USE_HIP
-    if (sconfig.max_ctx > 6144 && cache_type_k.empty() && cache_type_v.empty()) {
-        setenv("DFLASH27B_KV_TQ3", "1", 0);  // don't overwrite user env
-    }
-#endif
+    // TQ3_0 KV auto-selection was removed (2026-07): tq3_0 saved ~40% VRAM on
+    // large qwen contexts but is quality-risky and garbles laguna outright.
+    // KV types now come from each family's default (q8_0 for laguna, q4_0
+    // base) unless the user passes --cache-type-k/v explicitly.
 
     // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
@@ -1092,13 +1088,13 @@ int main(int argc, char ** argv) {
 #ifdef GGML_USE_HIP
         cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());
 #else
-        cache_type_k.empty() ? (sconfig.max_ctx > 6144 ? "tq3_0 (auto)" : "q4_0 (default)") : cache_type_k.c_str());
+        cache_type_k.empty() ? "family default" : cache_type_k.c_str());
 #endif
     std::fprintf(stderr, "[server] │  cache_type_v    = %s\n",
 #ifdef GGML_USE_HIP
         cache_type_v.empty() ? "q4_0 (default, HIP)" : cache_type_v.c_str());
 #else
-        cache_type_v.empty() ? (sconfig.max_ctx > 6144 ? "tq3_0 (auto)" : "q4_0 (default)") : cache_type_v.c_str());
+        cache_type_v.empty() ? "family default" : cache_type_v.c_str());
 #endif
     std::fprintf(stderr, "[server] │  pflash          = %s\n",
         sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" :
