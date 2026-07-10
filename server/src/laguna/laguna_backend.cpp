@@ -50,9 +50,9 @@ namespace dflash::common {
 namespace {
 
 // Laguna honors only the explicit per-axis --cache-type-k/v overrides.
-// The DFLASH27B_KV_F16/_Q4/_TQ3 shorthands are qwen-family toggles - the
-// server auto-sets _KV_TQ3 for max_ctx > 6144 - and must not displace
-// laguna's Q8_0 default (a TQ3_0/Q4_0 KV cache garbles laguna output).
+// The DFLASH27B_KV_F16/_Q4/_TQ3 shorthands are qwen-family toggles and
+// must not displace laguna's Q8_0 default (a TQ3_0/Q4_0 KV cache garbles
+// laguna output).
 static void resolve_laguna_kv_types(const LagunaBackendArgs & args,
                                     ggml_type & k_type,
                                     ggml_type & v_type) {
