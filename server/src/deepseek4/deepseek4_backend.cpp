@@ -463,9 +463,9 @@ void DeepSeek4Backend::print_ready_banner() const {
     std::fflush(stdout);
 }
 
-bool DeepSeek4Backend::park(const std::string & what) {
-    const bool want_target = (what.empty() || what == "all" || what == "target");
-    if (!want_target || parked_) return true;
+bool DeepSeek4Backend::park(ParkTarget target) {
+    const bool want_target_model = park_target_includes_target_model(target);
+    if (!want_target_model || parked_) return true;
 
     maybe_save_routing_stats();
     for (int i = 0; i < PREFIX_SLOTS; ++i) {
@@ -483,9 +483,9 @@ bool DeepSeek4Backend::park(const std::string & what) {
     return true;
 }
 
-bool DeepSeek4Backend::unpark(const std::string & what) {
-    const bool want_target = (what.empty() || what == "all" || what == "target");
-    if (!want_target || !parked_) return true;
+bool DeepSeek4Backend::unpark(ParkTarget target) {
+    const bool want_target_model = park_target_includes_target_model(target);
+    if (!want_target_model || !parked_) return true;
 
     const PlacementBackend target_backend =
         cfg_.device.backend == PlacementBackend::Auto
