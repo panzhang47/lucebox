@@ -217,6 +217,8 @@ static void print_usage(const char * prog) {
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
+        "  --ds4-prefill <mode> DeepSeek4 prefill: exact, dense, or sparse "
+        "(default: exact; sparse is experimental)\n"
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
@@ -420,6 +422,19 @@ int main(int argc, char ** argv) {
             bargs.device.peer_access = true;
         } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
             bargs.chunk = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--ds4-prefill") == 0 && i + 1 < argc) {
+            const char * mode = argv[++i];
+            if (std::strcmp(mode, "exact") == 0) {
+                bargs.ds4_prefill_mode = PrefillAttentionMode::Exact;
+            } else if (std::strcmp(mode, "dense") == 0) {
+                bargs.ds4_prefill_mode = PrefillAttentionMode::Dense;
+            } else if (std::strcmp(mode, "sparse") == 0) {
+                bargs.ds4_prefill_mode = PrefillAttentionMode::Sparse;
+            } else {
+                std::fprintf(stderr,
+                    "[server] --ds4-prefill expects exact, dense, or sparse\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--fa-window") == 0 && i + 1 < argc) {
             bargs.fa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
@@ -1060,6 +1075,8 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
                  bargs.device.peer_access ? "ON" : "off");
     std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
+    std::fprintf(stderr, "[server] │  ds4_prefill     = %s\n",
+                 prefill_attention_mode_name(bargs.ds4_prefill_mode));
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
     if (bargs.fa_window > 0) {
         std::fprintf(stderr, "[server] │  ⚠  fa_window > 0 drops system prompt / "

@@ -69,6 +69,11 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.output_us += src.output_us;
     dst.sample_us += src.sample_us;
     dst.emit_us += src.emit_us;
+    dst.full_graph_build_us += src.full_graph_build_us;
+    dst.full_graph_alloc_us += src.full_graph_alloc_us;
+    dst.full_graph_set_us += src.full_graph_set_us;
+    dst.full_graph_compute_us += src.full_graph_compute_us;
+    dst.full_graph_read_us += src.full_graph_read_us;
     dst.hot_selected += src.hot_selected;
     dst.cold_selected += src.cold_selected;
 }
@@ -92,6 +97,8 @@ static void log_step_tel(const char * phase,
         "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
         "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
         "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
+        "graph_build=%.1fms graph_alloc=%.1fms graph_set=%.1fms "
+        "graph_compute=%.1fms graph_read=%.1fms "
         "hot_sel=%d cold_sel=%d\n",
         phase, tokens, steps, wall_s, tok_s,
         ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
@@ -107,6 +114,9 @@ static void log_step_tel(const char * phase,
         ms(t.hc_pre_compute_us),
         ms(t.hc_post_attn_us + t.hc_post_ffn_us),
         ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
+        ms(t.full_graph_build_us), ms(t.full_graph_alloc_us),
+        ms(t.full_graph_set_us), ms(t.full_graph_compute_us),
+        ms(t.full_graph_read_us),
         t.hot_selected, t.cold_selected);
 }
 
@@ -347,6 +357,7 @@ bool DeepSeek4Backend::init() {
         std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
         return false;
     }
+    cache_.prefill_mode = cfg_.prefill_mode;
 
     if (moe_hybrid_) {
         // Expert IPC removed — layer split replaces expert split.
@@ -523,6 +534,7 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
         moe_placement_ = {};
         return false;
     }
+    cache_.prefill_mode = cfg_.prefill_mode;
 
     parked_ = false;
     std::printf("[deepseek4] unparked (VRAM restored)\n");
@@ -533,19 +545,24 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
                                   int kv_offset) {
-    // Hybrid currently implements HC for single-token steps only; keep prefill
-    // token-by-token so the first sampled token is seeded from the correct HC state.
+    // The all-hot layer-range path supports causal chunked prefill. The
+    // optimized graph snapshots the previous raw SWA window, attends over
+    // that snapshot plus the current ubatch, and commits only the final SWA
+    // tail. Learned compressor boundaries are emitted inside the same graph.
     //
-    // Chunked prefill (n_tokens > 1) is only exact while the whole prompt fits
-    // inside the raw SWA ring: the chunk graph writes ring slots pos % n_swa
-    // while attention reads the ring in the same graph, and the learned
-    // compressor only runs for the chunk's last token. Prompts beyond n_swa
-    // degrade into incoherence. Token-by-token prefill matches the reference
-    // semantics at any length; chunked stays available via
-    // DFLASH_DS4_CHUNKED_PREFILL=1 for short-prompt benchmarking only.
-    const bool unsafe_chunked = env_flag_enabled("DFLASH_DS4_CHUNKED_PREFILL");
-    const int chunk = (moe_hybrid_ || !unsafe_chunked) ? 1 : (cfg_.chunk > 0 ? cfg_.chunk : 512);
+    // Mixed hot/cold hybrid execution still has single-token HC semantics, so
+    // retain the reference path there.  --chunk 1 is the explicit fallback.
+    const int requested_chunk = cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa;
     const int n_total = (int)tokens.size();
+    // Bound the layer-major graph to the topology validated by the prefill
+    // kernels. Smaller tail chunks use the same scheduler or its reference
+    // fallback.
+    const int layer_major_cap = DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+    const int chunk = (moe_hybrid_ ||
+                       cfg_.prefill_mode == PrefillAttentionMode::Exact)
+        ? 1
+        : std::max(1, std::min(requested_chunk,
+                               layer_major_cap));
     int pos = kv_offset;
     // New sequence: clear the cache buffer so compressor state double-buffers
     // and compressed-KV rows start from zeros, exactly like a fresh server.
@@ -554,6 +571,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // request on can drift by a token or two.
     if (kv_offset == 0 && cache_.buf) {
         ggml_backend_buffer_clear(cache_.buf, 0);
+        cache_.cur_pos = 0;
+        for (DeepSeek4LayerCache & layer : cache_.layers) {
+            layer.n_comp = 0;
+            layer.n_index_comp = 0;
+        }
     }
     last_logits_.clear();
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
@@ -590,7 +612,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                             embed.data(), n_tok, pos,
                                             0, w_.n_layer, &logits,
                                             tokens.data() + i,
-                                            timing ? &step_tel : nullptr);
+                                            timing ? &step_tel : nullptr,
+                                            cfg_.prefill_mode !=
+                                                PrefillAttentionMode::Sparse);
         }
         if (!ok) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
