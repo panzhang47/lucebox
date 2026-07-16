@@ -881,7 +881,14 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;
-    std::vector<int32_t> history = history_prefix;
+    const bool process_logits = sampler_.needs_logit_processing();
+    std::vector<int32_t> history;
+    if (process_logits) {
+        history = history_prefix;
+        if (n_gen > 0) {
+            history.reserve(history.size() + (size_t)n_gen);
+        }
+    }
 
     for (int generated = 0; generated < n_gen; generated++) {
         if (io.cancelled) break;
@@ -929,7 +936,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
 
         int32_t next_token = 0;
         const auto sample_t0 = Clock::now();
-        if (sampler_.needs_logit_processing()) {
+        if (process_logits) {
             next_token = sample_logits(logits.data(), w_.n_vocab, sampler_,
                                        history, sampler_rng_);
         } else {
@@ -942,7 +949,9 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             }
         }
         if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
-        history.push_back(next_token);
+        if (process_logits) {
+            history.push_back(next_token);
+        }
         out_tokens.push_back(next_token);
         const auto emit_t0 = Clock::now();
         io.emit(next_token);
