@@ -316,25 +316,30 @@ DeepSeek4Backend::~DeepSeek4Backend() {
     shutdown();
 }
 
-bool DeepSeek4Backend::init() {
-    backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
-    if (!backend_) {
-        std::fprintf(stderr, "[deepseek4] failed to create CUDA backend (gpu=%d)\n",
-                     cfg_.device.gpu);
-        return false;
-    }
-
-    snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);
-
+bool DeepSeek4Backend::load_model() {
     const PlacementBackend target_backend =
         cfg_.device.backend == PlacementBackend::Auto
             ? compiled_placement_backend()
             : cfg_.device.backend;
 
-    // HIP single-device launches should avoid the monolithic full-model load:
-    // a managed ~80 GiB allocation can stall or be killed on integrated UMA
-    // systems before we ever reach the existing OOM fallback path.
-    if (target_backend == PlacementBackend::Hip) {
+    // The fused graph references every expert tensor directly, so it cannot
+    // run on the hybrid expert representation. Honor an explicit fused-decode
+    // request by trying the monolithic load first. Large HIP models otherwise
+    // keep using the hybrid path: a managed allocation can stall or be killed
+    // on integrated UMA systems before an OOM fallback is possible.
+    if (target_backend == PlacementBackend::Hip && cfg_.fused_decode) {
+        std::fprintf(stderr,
+                     "[deepseek4] fused decode requested; loading monolithic HIP model\n");
+        if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+            std::fprintf(stderr,
+                         "[deepseek4] monolithic HIP load failed; trying hybrid mode\n");
+            if (!init_hybrid_model()) {
+                std::fprintf(stderr, "[deepseek4] hybrid mode also failed: %s\n",
+                             cfg_.model_path);
+                return false;
+            }
+        }
+    } else if (target_backend == PlacementBackend::Hip) {
         std::fprintf(stderr,
                      "[deepseek4] HIP target detected; using hybrid expert load path\n");
         if (!init_hybrid_model()) {
@@ -356,7 +361,28 @@ bool DeepSeek4Backend::init() {
         return false;
     }
     w_.routed_expert_top_k = cfg_.expert_top_k;
-    w_.fused_decode = cfg_.fused_decode;
+    w_.fused_decode = cfg_.fused_decode && !moe_hybrid_;
+    if (cfg_.fused_decode && moe_hybrid_) {
+        std::fprintf(stderr,
+                     "[deepseek4] fused decode unavailable with hybrid expert placement; "
+                     "using layered decode\n");
+    }
+    return true;
+}
+
+bool DeepSeek4Backend::init() {
+    backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
+    if (!backend_) {
+        std::fprintf(stderr, "[deepseek4] failed to create CUDA backend (gpu=%d)\n",
+                     cfg_.device.gpu);
+        return false;
+    }
+
+    snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);
+
+    if (!load_model()) {
+        return false;
+    }
 
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
@@ -508,30 +534,13 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
     const bool want_target = (what.empty() || what == "all" || what == "target");
     if (!want_target || !parked_) return true;
 
-    const PlacementBackend target_backend =
-        cfg_.device.backend == PlacementBackend::Auto
-            ? compiled_placement_backend()
-            : cfg_.device.backend;
-
-    if (target_backend == PlacementBackend::Hip) {
-        if (!init_hybrid_model()) {
-            std::fprintf(stderr, "[deepseek4] unpark: failed to restore hybrid mode\n");
-            free_deepseek4_weights(w_);
-            stream_engine_.destroy();
-            moe_hybrid_.reset();
-            moe_placement_ = {};
-            return false;
-        }
-    } else if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
-        std::fprintf(stderr, "[deepseek4] unpark: full model reload failed, trying hybrid mode...\n");
-        if (!init_hybrid_model()) {
-            std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
-            free_deepseek4_weights(w_);
-            stream_engine_.destroy();
-            moe_hybrid_.reset();
-            moe_placement_ = {};
-            return false;
-        }
+    if (!load_model()) {
+        std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
+        free_deepseek4_weights(w_);
+        stream_engine_.destroy();
+        moe_hybrid_.reset();
+        moe_placement_ = {};
+        return false;
     }
 
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;

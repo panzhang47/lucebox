@@ -54,7 +54,10 @@ options are available:
 
 - `--ds4-fused-decode` enables the cached single-graph decode path. It keeps
   HC, attention, MoE, and the output projection on the GPU and avoids
-  per-layer host round trips.
+  per-layer host round trips. On HIP this option requests a monolithic model
+  load because the fused graph must reference every expert tensor directly.
+  If that allocation fails, the backend logs the fallback and continues with
+  hybrid expert placement and layered decode.
 - `--ds4-expert-top-k N` keeps the highest-ranked `N` routed experts and
   renormalizes their weights. `0` uses the model default. Reducing this value is an
   approximate inference policy and must be quality-validated for the target
