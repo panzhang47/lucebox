@@ -77,8 +77,15 @@ struct DS4Mmap {
         // Convert UTF-8 path to UTF-16 for CreateFileW — CreateFileA uses the
         // active ANSI code page and fails on non-ASCII paths (e.g. CJK chars).
         int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        if (wlen == 0) {
+            err = "MultiByteToWideChar: " + path + ": error " + std::to_string(GetLastError());
+            return false;
+        }
         std::wstring wpath(wlen, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+        if (MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen) == 0) {
+            err = "MultiByteToWideChar (fill): " + path + ": error " + std::to_string(GetLastError());
+            return false;
+        }
 
         hFile = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
