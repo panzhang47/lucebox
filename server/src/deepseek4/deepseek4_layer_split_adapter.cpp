@@ -601,6 +601,7 @@ bool DeepSeek4LayerSplitAdapter::decode_ar(
         int last_tok_in,
         int committed,
         int n_gen,
+        const std::vector<int32_t> & history_prefix,
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
     if (shards_.empty()) return false;
@@ -622,6 +623,7 @@ bool DeepSeek4LayerSplitAdapter::decode_ar(
     return run_layer_split_ar_decode(
         last_tok_in, committed, n_gen, vocab,
         prefill_last_logits_, sampler_, sampler_rng_,
+        history_prefix,
         forward_one, is_eos, out_tokens, io);
 }
 
