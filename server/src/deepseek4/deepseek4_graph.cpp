@@ -2223,7 +2223,6 @@ struct Ds4HcMatvecPool {
     std::condition_variable wait_cv;
     std::atomic<uint64_t> seq{0};
     std::atomic<int> remaining{0};
-    std::atomic<int> sleepers{0};
     Job job{};
     std::vector<std::thread> workers;
     std::atomic<bool> stop{false};
@@ -2252,12 +2251,10 @@ struct Ds4HcMatvecPool {
                     }
                     if (s == last && !stop.load(std::memory_order_relaxed)) {
                         std::unique_lock<std::mutex> lk(wait_mu);
-                        sleepers.fetch_add(1, std::memory_order_relaxed);
                         wait_cv.wait(lk, [&]() {
                             return stop.load(std::memory_order_relaxed) ||
                                    seq.load(std::memory_order_acquire) != last;
                         });
-                        sleepers.fetch_sub(1, std::memory_order_relaxed);
                         s = seq.load(std::memory_order_acquire);
                     }
                     if (stop.load(std::memory_order_relaxed)) return;
@@ -2293,7 +2290,13 @@ struct Ds4HcMatvecPool {
         }
     }
     ~Ds4HcMatvecPool() {
-        stop.store(true, std::memory_order_release);
+        {
+            // Protect predicate changes with the same mutex used by wait().
+            // Otherwise a worker can test the predicate, miss notify_all(),
+            // and sleep forever between the test and the wait.
+            std::lock_guard<std::mutex> lk(wait_mu);
+            stop.store(true, std::memory_order_release);
+        }
         wait_cv.notify_all();
         for (auto & t : workers) t.join();
     }
@@ -2304,10 +2307,14 @@ struct Ds4HcMatvecPool {
         const int active_workers = std::min(nth, rows);
         job = {mat, x, out, rows, cols, active_workers};
         remaining.store(active_workers, std::memory_order_release);
-        seq.fetch_add(1, std::memory_order_release);
-        if (sleepers.load(std::memory_order_relaxed) > 0) {
-            wait_cv.notify_all();
+        {
+            // Publish the new generation while holding wait_mu so a worker
+            // cannot miss the transition between its predicate check and
+            // blocking in wait().
+            std::lock_guard<std::mutex> wake_lk(wait_mu);
+            seq.fetch_add(1, std::memory_order_release);
         }
+        wait_cv.notify_all();
         int spins = 0;
         while (remaining.load(std::memory_order_acquire) != 0) {
             if (++spins < 65536) { cpu_relax(); }
@@ -2325,10 +2332,11 @@ struct Ds4HcMatvecPool {
         const int active_workers = std::min(nth, rows);
         job = {nullptr, nullptr, nullptr, rows, 0, active_workers};
         remaining.store(active_workers, std::memory_order_release);
-        seq.fetch_add(1, std::memory_order_release);
-        if (sleepers.load(std::memory_order_relaxed) > 0) {
-            wait_cv.notify_all();
+        {
+            std::lock_guard<std::mutex> wake_lk(wait_mu);
+            seq.fetch_add(1, std::memory_order_release);
         }
+        wait_cv.notify_all();
         int spins = 0;
         while (remaining.load(std::memory_order_acquire) != 0) {
             if (++spins < 65536) { cpu_relax(); }
