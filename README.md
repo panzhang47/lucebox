@@ -64,7 +64,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Qwen 3.6 27B HIP | **~2.6×** |
 | Gemma 4 26B-A4B | **1.31×** |
 | Gemma 4 31B IT | **3.2×** |
-| DeepSeek V4 Flash ROCMFPX HIP | **2×** |
+| [`DeepSeek V4 Flash ROCMFPX HIP`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-ROCMFPX) | **2×** |
 
 </td>
 <td valign="top">
