@@ -1,9 +1,19 @@
 #include "ds4-indexer.cuh"
 
 #if defined(GGML_USE_HIP)
-#    include <rocwmma/rocwmma.hpp>
+// rocWMMA 1.x rejects RDNA4/gfx1151 at compile time. Use the optimized path
+// only with rocWMMA 2.x or newer; older or header-less ROCm installations
+// retain the scalar implementation below.
+#    if __has_include(<rocwmma/rocwmma-version.hpp>)
+#        include <rocwmma/rocwmma-version.hpp>
+#    endif
+#    if defined(ROCWMMA_VERSION_MAJOR) && ROCWMMA_VERSION_MAJOR > 1
+#        include <rocwmma/rocwmma.hpp>
 namespace ds4_wmma = rocwmma;
-#    define DS4_INDEXER_WMMA_AVAILABLE 1
+#        define DS4_INDEXER_WMMA_AVAILABLE 1
+#    else
+#        define DS4_INDEXER_WMMA_AVAILABLE 0
+#    endif
 #elif !defined(GGML_USE_MUSA)
 #    include <mma.h>
 namespace ds4_wmma = nvcuda::wmma;
